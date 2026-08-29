@@ -17,12 +17,18 @@ import os
 import re
 import csv
 import json
+import sys
 import hashlib
 import mailbox
 import logging
 import argparse
 from pathlib import Path
 from datetime import datetime
+
+# Add project root to sys.path
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 import numpy as np
