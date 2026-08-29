@@ -40,11 +40,14 @@ def _one_hot_auth(value: str) -> Dict[str, int]:
 _EMAIL_DOMAIN_RE = re.compile(r"@([\w.\-]+)")
 
 
-def _extract_domain(address: str) -> Optional[str]:
+def _extract_domain(address) -> Optional[str]:
     """Extract the domain part from an email address string."""
-    if not address:
+    if address is None:
         return None
-    match = _EMAIL_DOMAIN_RE.search(address)
+    address_str = str(address).strip()
+    if not address_str or address_str.lower() == "nan":
+        return None
+    match = _EMAIL_DOMAIN_RE.search(address_str)
     return match.group(1).lower() if match else None
 
 
