@@ -1,0 +1,179 @@
+{
+  "version": 1,
+  "skills": {
+    "chrome-extensions": {
+      "source": "googlechrome/modern-web-guidance",
+      "sourceType": "github",
+      "skillPath": "skills/chrome-extensions/SKILL.md",
+      "computedHash": "4b7e7beb7711c75ba267dcd5e3483d56aaa49d4670db88fd8619afea970cbccc"
+    },
+    "git-guardrails-claude-code": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/misc/git-guardrails-claude-code/SKILL.md",
+      "computedHash": "fa22f1aa2708d95cc3149640f33e085381b184a0322609930f7971c1dca11835"
+    },
+    "hf-cli": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/hf-cli/SKILL.md",
+      "computedHash": "7e18d39eef6e1519417aa2a48112fe7df8ea1b0f5051ab62f1635c7029f34404"
+    },
+    "hf-cloud-aws-context-discovery": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/hf-cloud-aws-context-discovery/SKILL.md",
+      "computedHash": "98701f0010e7549a5675cf271fcf3450c2461c1ed265d38c444cb8b4ee729087"
+    },
+    "hf-cloud-python-env-setup": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/hf-cloud-python-env-setup/SKILL.md",
+      "computedHash": "b9060c151e862d9dbc18c19882d38770365b83fab7ab6cb71527fe7a0b1dc243"
+    },
+    "hf-cloud-sagemaker-deployment-planner": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/hf-cloud-sagemaker-deployment-planner/SKILL.md",
+      "computedHash": "b56a546a7100e316fb6ecdc155ed995ed5edcec22260082f8448d51d4e7643e9"
+    },
+    "hf-cloud-sagemaker-iam-preflight": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/hf-cloud-sagemaker-iam-preflight/SKILL.md",
+      "computedHash": "ae48158d6ce61db246518a949c0800e09bf038192e20100256cc50b3625e6acc"
+    },
+    "hf-cloud-sagemaker-production-defaults": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/hf-cloud-sagemaker-production-defaults/SKILL.md",
+      "computedHash": "a1797de427ebb1676a05618ad913d8c69400c95ab143271db3d4839532b003fe"
+    },
+    "hf-cloud-serving-image-selection": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/hf-cloud-serving-image-selection/SKILL.md",
+      "computedHash": "7224e12edab272075c0c7e8e705aaf8f5879f195fdef650fcab74e714bb537d2"
+    },
+    "hf-mem": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/hf-mem/SKILL.md",
+      "computedHash": "09de3deaf8a6399ede5f144551142a4a3a705c5bd0bb83938d585169d2685f0f"
+    },
+    "huggingface-best": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-best/SKILL.md",
+      "computedHash": "31eeb3a90dc9562122929138784c065998defa8f6985a759f04b09e8873a4520"
+    },
+    "huggingface-community-evals": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-community-evals/SKILL.md",
+      "computedHash": "51b42948064ee943df2995af543c7d011d0786eb8ee04392eb9ea60e359833b2"
+    },
+    "huggingface-datasets": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-datasets/SKILL.md",
+      "computedHash": "d28d1ee4a61133ab6c1e12c74094681c2026c7e656784bd09831f91618fd0120"
+    },
+    "huggingface-gradio": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-gradio/SKILL.md",
+      "computedHash": "176783c67b865fa77395b45776a34ea67214911d8ed6a188da661d59a1197a8b"
+    },
+    "huggingface-llm-trainer": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-llm-trainer/SKILL.md",
+      "computedHash": "8be6c56dfe7705d44fecb2707aaae2540f93281ef72580a2c2ab1a961b476af9"
+    },
+    "huggingface-local-models": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-local-models/SKILL.md",
+      "computedHash": "3cbaf709aa2712d7ec028d1a376557e49bdb37395708a7c152f95398eb0e4e5b"
+    },
+    "huggingface-lora-space-builder": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-lora-space-builder/SKILL.md",
+      "computedHash": "ee4cc2e2bbdf2b7afd0f509b9ac7f0ee6a68bbcbacb34b99731fe68b83a26da7"
+    },
+    "huggingface-paper-publisher": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-paper-publisher/SKILL.md",
+      "computedHash": "996d4a2a9d46e04396da4e47c4e82e830c79053acaac56b6b9beb6951f6c375a"
+    },
+    "huggingface-papers": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-papers/SKILL.md",
+      "computedHash": "2ebe1d72b530d4d3cef0d6345d3f5cc892446af73efe0227038def6a1a3cd658"
+    },
+    "huggingface-spaces": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-spaces/SKILL.md",
+      "computedHash": "fcab17ea835b76b600fcb350ef426da614511a79a1c119f684ebe07068c0cdc2"
+    },
+    "huggingface-tool-builder": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-tool-builder/SKILL.md",
+      "computedHash": "af775b66feb5b2df24d7a5dd512a46e6b406244dd54ae69dd50caf99c63d8f83"
+    },
+    "huggingface-trackio": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-trackio/SKILL.md",
+      "computedHash": "0c1997781ab76c10cd04d68bf107af973e25e2ab2a76c2d17dbf8164731ced70"
+    },
+    "huggingface-vision-trainer": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-vision-trainer/SKILL.md",
+      "computedHash": "16b4be9f325dfcb0b01e8c7a3514dc437558e74a93a7c6ddf8636baa94fcf5b1"
+    },
+    "huggingface-zerogpu": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-zerogpu/SKILL.md",
+      "computedHash": "94f89502a679c5bb899617014cd1d801771941d2cc5824d6bdcccb892047356f"
+    },
+    "jupyter-notebook": {
+      "source": "openai/skills",
+      "sourceType": "github",
+      "skillPath": "skills/.curated/jupyter-notebook/SKILL.md",
+      "computedHash": "ed6cf5b159eeb076eaa43007920ae5aca10336ad1e6cec7baf973f3f83a9eb7f"
+    },
+    "pandas-pro": {
+      "source": "jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/pandas-pro/SKILL.md",
+      "computedHash": "244a87c4e9e20aac2822cdd99a221a7fa6999bf1194abbbd4a5e16bde34bf6ef"
+    },
+    "train-sentence-transformers": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/train-sentence-transformers/SKILL.md",
+      "computedHash": "a4cb483748d9ca2b9d3faa1340e3896389a95798a5dae1aeef13df2b1c31af56"
+    },
+    "transformers-js": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/transformers-js/SKILL.md",
+      "computedHash": "1fca591721276bc2bc240759320a10ed5165602c9dd639265d359acee5fb6388"
+    },
+    "trl-training": {
+      "source": "huggingface/skills",
+      "sourceType": "github",
+      "skillPath": "skills/trl-training/SKILL.md",
+      "computedHash": "fe269c4624638e85b9bfece55cf55b978d52b908d0f6e611626fa9445d2052f7"
+    }
+  }
+}

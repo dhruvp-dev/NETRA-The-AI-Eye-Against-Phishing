@@ -1,0 +1,18 @@
+# Data directory (exclude dataset files from git)
+data/raw/
+data/processed/
+
+# Python / ML artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+ml/models/*.pkl
+ml/models/training_metrics.json
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
