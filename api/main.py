@@ -1,26 +1,29 @@
-﻿"""
-NETRA - FastAPI Inference Server
-==================================
+﻿# -*- coding: utf-8 -*-
+"""
+NETRA - FastAPI Inference Server v2
+=====================================
 Serves Tier-1 phishing detection model over a local REST API.
+Supports both DistilBERT (Phase 2) and calibrated Random Forest (Phase 1) inference.
 
 Start server:
     uvicorn api.main:app --host 127.0.0.1 --port 8000
 
 Endpoints:
-    GET  /health      -> {"status": "ok", "model_loaded": bool, "model_type": str, "thresholds": {...}}
-    POST /predict     -> classification + risk_score + confidence + tier + threshold_used + model_type
-
-IMPORTANT: This server binds to 127.0.0.1 only (not exposed to the network).
+    GET  /health                 -> server + model status + active thresholds
+    POST /predict                -> classification + risk_score + signals
+    POST /admin/recalibrate      -> live threshold tuning without restart
 """
 
 import json
 import logging
-import os
 import sys
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
-# --- Add project root to sys.path ---
+# ---------------------------------------------------------------------------
+# Project root on sys.path (needed for ml.features imports in subprocess)
+# ---------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -32,52 +35,51 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-MODELS_DIR              = ROOT / "ml" / "models"
-MODEL_CALIBRATED_PATH   = MODELS_DIR / "tier1_model_calibrated.pkl"
-MODEL_PATH              = MODELS_DIR / "tier1_model.pkl"
-TFIDF_PATH              = MODELS_DIR / "tfidf_vectorizer.pkl"
-THRESHOLD_CONFIG_PATH   = MODELS_DIR / "threshold_config.json"
+MODELS_DIR             = ROOT / "ml" / "models"
+MODEL_CALIBRATED_PATH  = MODELS_DIR / "tier1_model_calibrated.pkl"
+MODEL_PATH             = MODELS_DIR / "tier1_model.pkl"
+TFIDF_PATH             = MODELS_DIR / "tfidf_vectorizer.pkl"
+THRESHOLD_CONFIG_PATH  = MODELS_DIR / "threshold_config.json"
+DISTILBERT_CONFIG_PATH = MODELS_DIR / "distilbert_config.json"
+DISTILBERT_MODEL_PATH  = MODELS_DIR / "distilbert_tier1.pt"
+DISTILBERT_TOKENIZER_PATH = MODELS_DIR / "distilbert_tokenizer"
 
 # ---------------------------------------------------------------------------
-# Safe fallback thresholds (empirically derived from raw RF score range 0.03-0.24)
+# Safe defaults (matches manual_empirical_v2 patch)
 # ---------------------------------------------------------------------------
-DEFAULT_PHISHING_THRESHOLD  = 0.15
-DEFAULT_SUSPICIOUS_LOWER    = 0.09
+DEFAULT_PHISHING_THRESHOLD = 0.2500
+DEFAULT_SUSPICIOUS_LOWER   = 0.0800
 
 # ---------------------------------------------------------------------------
-# App initialisation
+# Urgency keywords for signal extraction
+# ---------------------------------------------------------------------------
+URGENCY_KEYWORDS = [
+    "urgent", "immediately", "suspended", "verify", "click here",
+    "confirm your", "account closure", "within 24 hours", "within 30 minutes",
+    "permanent", "act now", "expires today", "validate", "update your",
+]
+
+# ---------------------------------------------------------------------------
+# App
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="NETRA Phishing Detection API",
-    description="Tier-1 ML-based email phishing detection. Local use only.",
-    version="1.1.0",
+    description="AI-powered phishing email detection. Local use only.",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost",
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-        "chrome-extension://*",
-    ],
+    allow_origins=["http://localhost", "http://localhost:3000", "http://127.0.0.1",
+                   "chrome-extension://*"],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
@@ -87,169 +89,362 @@ app.add_middleware(
 # Global model state
 # ---------------------------------------------------------------------------
 class ModelState:
-    model         = None
-    text_extractor = None
-    loaded        = False
-    error: Optional[str] = None
-    model_type: str = "uncalibrated"
+    # RF state
+    rf_model         = None
+    text_extractor   = None
+    rf_ready: bool   = False
+    rf_model_type: str = "uncalibrated_rf"
+
+    # DistilBERT state
+    db_model         = None
+    db_tokenizer     = None
+    db_config: dict  = {}
+    db_ready: bool   = False
+
+    # Active thresholds
     phishing_threshold: float  = DEFAULT_PHISHING_THRESHOLD
     suspicious_lower: float    = DEFAULT_SUSPICIOUS_LOWER
     suspicious_upper: float    = DEFAULT_PHISHING_THRESHOLD
     threshold_source: str      = "default_fallback"
 
+    @property
+    def model_type(self) -> str:
+        if self.db_ready:
+            return "distilbert"
+        return self.rf_model_type
+
+    @property
+    def model_loaded(self) -> bool:
+        return self.db_ready or self.rf_ready
+
 state = ModelState()
 
 
-@app.on_event("startup")
-def load_models():
-    """Load model artifacts and threshold config on startup."""
-    log.info("Loading NETRA Tier-1 model artifacts...")
-
-    # --- Load threshold config ---
+# ---------------------------------------------------------------------------
+# Threshold config helpers
+# ---------------------------------------------------------------------------
+def _load_thresholds():
+    """Load threshold config from JSON file into state."""
     if THRESHOLD_CONFIG_PATH.exists():
         try:
             with open(THRESHOLD_CONFIG_PATH) as f:
                 cfg = json.load(f)
-            state.phishing_threshold  = cfg.get("phishing_threshold",  DEFAULT_PHISHING_THRESHOLD)
-            state.suspicious_lower    = cfg.get("suspicious_lower",    DEFAULT_SUSPICIOUS_LOWER)
-            state.suspicious_upper    = cfg.get("suspicious_upper",    state.phishing_threshold)
-            state.threshold_source    = cfg.get("method", "threshold_config.json")
-            log.info(f"Loaded threshold config: phishing>={state.phishing_threshold:.4f} | suspicious [{state.suspicious_lower:.4f}, {state.suspicious_upper:.4f})")
+            state.phishing_threshold = cfg.get("phishing_threshold", DEFAULT_PHISHING_THRESHOLD)
+            state.suspicious_lower   = cfg.get("suspicious_lower",   DEFAULT_SUSPICIOUS_LOWER)
+            state.suspicious_upper   = cfg.get("suspicious_upper",   state.phishing_threshold)
+            state.threshold_source   = cfg.get("method", "threshold_config.json")
+            log.info(f"Thresholds loaded: phishing>={state.phishing_threshold:.4f} "
+                     f"| suspicious [{state.suspicious_lower:.4f}, {state.suspicious_upper:.4f})")
         except Exception as e:
-            log.warning(f"Could not load threshold_config.json: {e} — using defaults")
+            log.warning(f"Could not read threshold_config.json: {e} — using defaults")
     else:
-        log.warning(f"threshold_config.json not found — using safe defaults: phishing>={DEFAULT_PHISHING_THRESHOLD}, suspicious>={DEFAULT_SUSPICIOUS_LOWER}")
+        log.warning(f"threshold_config.json not found — using defaults: "
+                    f"phishing>={DEFAULT_PHISHING_THRESHOLD}, suspicious>={DEFAULT_SUSPICIOUS_LOWER}")
 
-    # --- Load model (calibrated preferred, fall back to raw) ---
-    if MODEL_CALIBRATED_PATH.exists():
-        model_path = MODEL_CALIBRATED_PATH
-        state.model_type = "calibrated"
-    elif MODEL_PATH.exists():
-        model_path = MODEL_PATH
-        state.model_type = "uncalibrated"
-    else:
-        state.error = "model_not_trained"
-        log.warning("No model file found. /predict will return 503 until model is trained.")
-        return
 
-    if not TFIDF_PATH.exists():
-        state.error = "tfidf_not_found"
-        log.warning(f"TF-IDF vectorizer not found: {TFIDF_PATH}")
-        return
+def _save_thresholds():
+    """Write current in-memory thresholds back to JSON file."""
+    cfg = {
+        "phishing_threshold": state.phishing_threshold,
+        "suspicious_lower":   state.suspicious_lower,
+        "suspicious_upper":   state.suspicious_upper,
+        "method":             state.threshold_source,
+    }
+    with open(THRESHOLD_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
 
-    try:
-        state.model          = joblib.load(model_path)
-        state.text_extractor = joblib.load(TFIDF_PATH)
-        state.loaded         = True
-        state.error          = None
-        log.info(f"Loaded model [{state.model_type}]: {model_path.name}")
-        log.info(f"Thresholds: phishing>={state.phishing_threshold:.4f} | suspicious [{state.suspicious_lower:.4f}, {state.phishing_threshold:.4f})")
-    except Exception as e:
-        state.error = str(e)
-        log.error(f"Failed to load models: {e}")
+
+# ---------------------------------------------------------------------------
+# Startup: load all artifacts
+# ---------------------------------------------------------------------------
+@app.on_event("startup")
+def load_models():
+    log.info("=" * 60)
+    log.info("NETRA API v2 starting up...")
+    log.info("=" * 60)
+
+    _load_thresholds()
+
+    # --- Try DistilBERT first ---
+    if DISTILBERT_CONFIG_PATH.exists() and DISTILBERT_MODEL_PATH.exists() and DISTILBERT_TOKENIZER_PATH.exists():
+        try:
+            import torch
+            from transformers import AutoTokenizer, DistilBertModel
+            import torch.nn as nn
+
+            with open(DISTILBERT_CONFIG_PATH) as f:
+                state.db_config = json.load(f)
+
+            class PhishingClassifier(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.distilbert = DistilBertModel.from_pretrained("distilbert-base-uncased")
+                    self.header_projection = nn.Linear(10, 32)
+                    self.classifier = nn.Sequential(
+                        nn.Linear(768 + 32, 256), nn.ReLU(), nn.Dropout(0.3), nn.Linear(256, 2)
+                    )
+                def forward(self, input_ids, attention_mask, header_features):
+                    cls = self.distilbert(input_ids, attention_mask).last_hidden_state[:, 0, :]
+                    hdr = torch.relu(self.header_projection(header_features))
+                    return self.classifier(torch.cat([cls, hdr], dim=1))
+
+            db_model = PhishingClassifier()
+            db_model.load_state_dict(torch.load(DISTILBERT_MODEL_PATH, map_location="cpu"))
+            db_model.eval()
+
+            state.db_tokenizer = AutoTokenizer.from_pretrained(str(DISTILBERT_TOKENIZER_PATH))
+            state.db_model     = db_model
+            state.db_ready     = True
+            log.info("DistilBERT model loaded successfully.")
+        except Exception as e:
+            log.warning(f"DistilBERT load failed: {e} — falling back to RF")
+
+    # --- Load RF (always load as fallback) ---
+    rf_path = MODEL_CALIBRATED_PATH if MODEL_CALIBRATED_PATH.exists() else MODEL_PATH
+    if rf_path.exists() and TFIDF_PATH.exists():
+        try:
+            state.rf_model       = joblib.load(rf_path)
+            state.text_extractor = joblib.load(TFIDF_PATH)
+            state.rf_ready       = True
+            state.rf_model_type  = "calibrated_rf" if MODEL_CALIBRATED_PATH.exists() else "uncalibrated_rf"
+            log.info(f"RF model loaded [{state.rf_model_type}]: {rf_path.name}")
+        except Exception as e:
+            log.error(f"RF model load failed: {e}")
+
+    log.info(f"Active model: {state.model_type} | Loaded: {state.model_loaded}")
 
 
 # ---------------------------------------------------------------------------
 # Request / Response schemas
 # ---------------------------------------------------------------------------
 class PredictRequest(BaseModel):
-    body_text: str = Field(..., description="Email body content")
-    urls: Optional[List[str]] = Field(default=[], description="List of URLs found in the email")
-    sender: Optional[str] = Field(default=None, description="Sender email address")
-    reply_to: Optional[str] = Field(default=None, description="Reply-To email address")
-    headers: Optional[Dict[str, Any]] = Field(default=None, description="Parsed email headers dict")
+    body_text: str = Field(..., description="Full email body text")
+    urls: Optional[List[str]] = Field(default=[], description="URLs extracted from email")
+    sender: Optional[str]     = Field(default=None)
+    reply_to: Optional[str]   = Field(default=None)
+    headers: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Parsed email auth headers. Expected keys: "
+            "'spf' ('pass'|'fail'|'none'|'neutral'), "
+            "'dkim' ('pass'|'fail'|'none'), "
+            "'dmarc' ('pass'|'fail'|'none')"
+        )
+    )
 
     class Config:
-        json_schema_extra = {
-            "example": {
-                "body_text": "Your account has been suspended. Click here immediately to verify.",
-                "urls": ["http://phish.example.tk/login"],
-                "sender": "security@bank-alerts.com",
-                "reply_to": "reply@harvester.net",
-                "headers": {"spf": "fail", "dkim": "none", "dmarc": "fail"}
-            }
-        }
+        json_schema_extra = {"example": {
+            "body_text": "URGENT: Your account is suspended. Verify immediately.",
+            "urls": ["http://paypa1-secure.example.tk/login"],
+            "sender": "security@paypa1-alert.com",
+            "reply_to": "verify@account-recovery.example",
+            "headers": {"spf": "fail", "dkim": "fail", "dmarc": "fail"}
+        }}
+
+
+class SignalsDict(BaseModel):
+    header_auth_failed: bool
+    urgency_detected: bool
+    suspicious_urls: int
+    typosquatting_detected: bool
 
 
 class PredictResponse(BaseModel):
     classification: str
     risk_score: float
     confidence: float
-    tier: int = 1
-    threshold_used: float
+    risk_level: str
     model_type: str
+    threshold_used: float
+    signals: SignalsDict
+    processing_time_ms: float
 
 
 class HealthResponse(BaseModel):
     status: str
-    model_loaded: bool
     model_type: str
+    model_loaded: bool
+    distilbert_ready: bool
+    rf_ready: bool
     thresholds: Dict[str, float]
     threshold_source: str
     error: Optional[str] = None
 
 
+class RecalibrateRequest(BaseModel):
+    suspicious_lower: float
+    suspicious_upper: float
+    phishing_threshold: float
+
+
+class RecalibrateResponse(BaseModel):
+    status: str
+    new_thresholds: Dict[str, float]
+
+
 # ---------------------------------------------------------------------------
-# Feature assembly
+# Signal extraction helpers
 # ---------------------------------------------------------------------------
-def predict_single(req: PredictRequest) -> dict:
+def _extract_signals(req: PredictRequest) -> dict:
+    """Extract interpretable signals from the request for the response body."""
+    from ml.features.url_features import extract as url_extract
+
+    # Header auth failures
+    hdrs = req.headers or {}
+    spf  = str(hdrs.get("spf",  "none")).lower()
+    dkim = str(hdrs.get("dkim", "none")).lower()
+    dmarc= str(hdrs.get("dmarc","none")).lower()
+    header_auth_failed = any(v in ("fail", "softfail") for v in [spf, dkim, dmarc])
+
+    # Urgency keyword count
+    body_lower = req.body_text.lower()
+    urgency_count = sum(1 for kw in URGENCY_KEYWORDS if kw in body_lower)
+    urgency_detected = urgency_count >= 2
+
+    # URL signals
+    url_feats = url_extract(req.urls or [])
+    suspicious_urls_count = int(
+        url_feats["any_http_url"] +
+        url_feats["any_phishing_tld"] +
+        url_feats["any_typosquatting"]
+    )
+    typosquatting = bool(url_feats.get("any_typosquatting", 0))
+
+    return {
+        "header_auth_failed":    header_auth_failed,
+        "urgency_detected":      urgency_detected,
+        "suspicious_urls":       suspicious_urls_count,
+        "typosquatting_detected": typosquatting,
+    }
+
+
+def _extract_header_features(req: PredictRequest) -> dict:
+    """
+    Parse headers dict into 10 boolean/int features for model input.
+    Keys: spf_pass, spf_fail, spf_none, dkim_pass, dkim_fail, dkim_none,
+          dmarc_pass, dmarc_fail, dmarc_none, sender_domain_match
+    """
+    from ml.features.header_features import extract as header_extract, HEADER_FEATURE_NAMES
+    hdrs = req.headers or {}
+    feat = header_extract(
+        headers_dict=hdrs,
+        sender=req.sender or "",
+        reply_to=req.reply_to or "",
+    )
+    return feat
+
+
+def _risk_level(score: float) -> str:
+    if score < 0.08:   return "LOW"
+    if score < 0.20:   return "MEDIUM"
+    if score < 0.50:   return "HIGH"
+    return "CRITICAL"
+
+
+def _classify(risk_score: float, confidence: float) -> str:
+    pt = state.phishing_threshold
+    sl = state.suspicious_lower
+    if risk_score >= pt:
+        return "PHISHING"
+    elif risk_score >= sl:
+        return "SUSPICIOUS"
+    else:
+        return "LEGITIMATE"
+
+
+# ---------------------------------------------------------------------------
+# RF predict
+# ---------------------------------------------------------------------------
+def _predict_rf(req: PredictRequest) -> dict:
     from scipy.sparse import hstack, csr_matrix
     from ml.features.url_features import extract as url_extract, URL_FEATURE_NAMES
     from ml.features.header_features import extract as header_extract, HEADER_FEATURE_NAMES
     import pandas as pd
 
     df = pd.DataFrame([{
-        "body_text":          req.body_text or "",
-        "subject":            "",
-        "urls":               json.dumps(req.urls or []),
-        "sender":             req.sender or "",
-        "reply_to":           req.reply_to or "",
-        "headers_available":  json.dumps(req.headers or {}),
+        "body_text":         req.body_text or "",
+        "subject":           "",
+        "urls":              json.dumps(req.urls or []),
+        "sender":            req.sender or "",
+        "reply_to":          req.reply_to or "",
+        "headers_available": json.dumps(req.headers or {}),
     }])
 
     X_text = state.text_extractor.transform(df)
 
-    urls     = req.urls or []
-    url_feat = url_extract(urls)
-    X_url    = csr_matrix(
-        np.array([url_feat[k] for k in URL_FEATURE_NAMES], dtype=np.float32).reshape(1, -1)
-    )
+    url_feat = url_extract(req.urls or [])
+    X_url    = csr_matrix(np.array([url_feat[k] for k in URL_FEATURE_NAMES],
+                                    dtype=np.float32).reshape(1, -1))
 
-    headers     = req.headers or {}
-    header_feat = header_extract(
-        headers_dict=headers,
-        sender=req.sender or "",
-        reply_to=req.reply_to or "",
-    )
-    X_header = csr_matrix(
-        np.array([header_feat[k] for k in HEADER_FEATURE_NAMES], dtype=np.float32).reshape(1, -1)
-    )
+    hdr_feat = header_extract(req.headers or {}, req.sender or "", req.reply_to or "")
+    X_hdr    = csr_matrix(np.array([hdr_feat[k] for k in HEADER_FEATURE_NAMES],
+                                    dtype=np.float32).reshape(1, -1))
 
-    X          = hstack([X_text, X_url, X_header])
-    proba      = state.model.predict_proba(X)[0]
+    X          = hstack([X_text, X_url, X_hdr])
+    proba      = state.rf_model.predict_proba(X)[0]
     risk_score = float(proba[1])
-
-    # --- Dynamic threshold classification ---
     pt = state.phishing_threshold
     sl = state.suspicious_lower
 
     if risk_score >= pt:
-        classification = "PHISHING"
-        confidence     = risk_score - pt
+        cls        = "PHISHING"
+        confidence = risk_score - pt
     elif risk_score >= sl:
-        classification = "SUSPICIOUS"
-        confidence     = min(risk_score - sl, pt - risk_score)
+        cls        = "SUSPICIOUS"
+        confidence = min(risk_score - sl, pt - risk_score)
     else:
-        classification = "LEGITIMATE"
-        confidence     = sl - risk_score
+        cls        = "LEGITIMATE"
+        confidence = sl - risk_score
 
     return {
-        "classification": classification,
+        "classification": cls,
+        "risk_score":     round(risk_score, 4),
+        "confidence":     round(max(confidence, 0.0), 4),
+        "threshold_used": round(pt, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# DistilBERT predict
+# ---------------------------------------------------------------------------
+def _predict_distilbert(req: PredictRequest) -> dict:
+    import torch
+    from ml.features.header_features import extract as header_extract, HEADER_FEATURE_NAMES
+
+    max_len     = state.db_config.get("max_length", 256)
+    conf_thresh = state.db_config.get("confidence_threshold", 0.70)
+
+    enc = state.db_tokenizer(
+        req.body_text or "",
+        max_length=max_len, truncation=True, padding="max_length", return_tensors="pt"
+    )
+
+    hdr_feat = header_extract(req.headers or {}, req.sender or "", req.reply_to or "")
+    hdr_tensor = torch.tensor(
+        [[float(hdr_feat.get(k, 0)) for k in HEADER_FEATURE_NAMES]], dtype=torch.float32
+    )
+
+    with torch.no_grad():
+        logits = state.db_model(
+            enc["input_ids"], enc["attention_mask"], hdr_tensor
+        )
+        proba      = torch.softmax(logits, dim=1)[0].numpy()
+        risk_score = float(proba[1])
+        confidence = float(max(proba))
+        pt         = state.phishing_threshold
+
+        if confidence < conf_thresh:
+            cls = "SUSPICIOUS"
+        elif proba[1] > proba[0]:
+            cls = "PHISHING"
+        else:
+            cls = "LEGITIMATE"
+
+    return {
+        "classification": cls,
         "risk_score":     round(risk_score, 4),
         "confidence":     round(confidence, 4),
-        "tier":           1,
         "threshold_used": round(pt, 4),
-        "model_type":     state.model_type,
     }
 
 
@@ -260,47 +455,100 @@ def predict_single(req: PredictRequest) -> dict:
 async def health():
     return HealthResponse(
         status="ok",
-        model_loaded=state.loaded,
         model_type=state.model_type,
+        model_loaded=state.model_loaded,
+        distilbert_ready=state.db_ready,
+        rf_ready=state.rf_ready,
         thresholds={
             "phishing":         round(state.phishing_threshold, 4),
             "suspicious_lower": round(state.suspicious_lower, 4),
             "suspicious_upper": round(state.suspicious_upper, 4),
         },
         threshold_source=state.threshold_source,
-        error=state.error,
     )
 
 
 @app.post("/predict", response_model=PredictResponse, tags=["inference"])
 async def predict(req: PredictRequest):
-    if not state.loaded:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": state.error or "model_not_loaded",
-                "message": "The ML model has not been trained yet. Train the model first using ml/train.py.",
-            },
-        )
-
+    if not state.model_loaded:
+        raise HTTPException(status_code=503, detail={
+            "error": "model_not_loaded",
+            "message": "No model loaded. Run ml/train.py first.",
+        })
     if not req.body_text or not req.body_text.strip():
         raise HTTPException(status_code=422, detail="body_text must not be empty.")
 
+    t0 = time.perf_counter()
     try:
-        result = predict_single(req)
-        log.info(
-            f"Prediction: {result['classification']} "
-            f"(score={result['risk_score']:.4f}, threshold={result['threshold_used']:.4f}, "
-            f"model={result['model_type']})"
+        if state.db_ready:
+            result = _predict_distilbert(req)
+        else:
+            result = _predict_rf(req)
+
+        signals = _extract_signals(req)
+        elapsed = round((time.perf_counter() - t0) * 1000, 2)
+
+        log.info(f"Predict [{state.model_type}]: {result['classification']} "
+                 f"score={result['risk_score']:.4f} "
+                 f"urgency={signals['urgency_detected']} "
+                 f"typosquat={signals['typosquatting_detected']} "
+                 f"auth_fail={signals['header_auth_failed']} "
+                 f"elapsed={elapsed}ms")
+
+        return PredictResponse(
+            classification   = result["classification"],
+            risk_score       = result["risk_score"],
+            confidence       = result["confidence"],
+            risk_level       = _risk_level(result["risk_score"]),
+            model_type       = state.model_type,
+            threshold_used   = result["threshold_used"],
+            signals          = SignalsDict(**signals),
+            processing_time_ms = elapsed,
         )
-        return PredictResponse(**result)
+
     except Exception as e:
         log.error(f"Prediction error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 
+@app.post("/admin/recalibrate", response_model=RecalibrateResponse, tags=["admin"])
+async def recalibrate(req: RecalibrateRequest):
+    """
+    Live threshold tuning without server restart.
+    Useful for tuning during mentor demos.
+
+    Validates: 0 < suspicious_lower < suspicious_upper <= phishing_threshold < 1.0
+    """
+    sl = req.suspicious_lower
+    su = req.suspicious_upper
+    pt = req.phishing_threshold
+
+    if not (0 < sl < su <= pt < 1.0):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid threshold ordering. Required: 0 < suspicious_lower({sl}) "
+                   f"< suspicious_upper({su}) <= phishing_threshold({pt}) < 1.0"
+        )
+
+    state.suspicious_lower    = sl
+    state.suspicious_upper    = su
+    state.phishing_threshold  = pt
+    state.threshold_source    = "manual_recalibrate"
+    _save_thresholds()
+
+    log.info(f"Thresholds recalibrated: phishing>={pt} | suspicious [{sl}, {su})")
+    return RecalibrateResponse(
+        status="recalibrated",
+        new_thresholds={
+            "phishing":         pt,
+            "suspicious_lower": sl,
+            "suspicious_upper": su,
+        }
+    )
+
+
 @app.exception_handler(404)
-async def not_found_handler(request: Request, exc: HTTPException):
+async def not_found_handler(request: Request, exc):
     return JSONResponse(
         status_code=404,
         content={"error": "Not found", "path": str(request.url.path)},
