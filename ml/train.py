@@ -1,4 +1,4 @@
-"""
+﻿"""
 NETRA - Tier-1 Training Script
 ================================
 Trains three candidate models on the unified dataset and saves the best.
@@ -47,6 +47,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from imblearn.over_sampling import SMOTE
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -183,7 +184,7 @@ def evaluate_model(
     if hasattr(model, "predict_proba"):
         y_prob = model.predict_proba(X_val)[:, 1]
     else:
-        # CalibratedClassifierCV wraps LinearSVC — will always have predict_proba
+        # CalibratedClassifierCV wraps LinearSVC â€” will always have predict_proba
         y_prob = np.zeros(len(y_val))
 
     acc = accuracy_score(y_val, y_pred)
@@ -208,7 +209,7 @@ def evaluate_model(
         f"  Model  : {model_name}\n"
         f"  Acc    : {acc:.4f}\n"
         f"  Prec   : {prec:.4f}\n"
-        f"  Recall : {rec:.4f}   ← phishing recall\n"
+        f"  Recall : {rec:.4f}   â† phishing recall\n"
         f"  F1     : {f1:.4f}\n"
         f"  FPR    : {fpr:.4f}\n"
         f"  PR-AUC : {pr_auc:.4f}\n"
@@ -318,6 +319,21 @@ def train(data_csv: Path = DATA_CSV):
     log.info(f"Train label distribution: {np.bincount(y_train)}")
     log.info(f"Val   label distribution: {np.bincount(y_val)}")
 
+
+    # ---------------------------------------------------------------------------
+    # SMOTE Oversampling (train split only — val/test untouched)
+    # ---------------------------------------------------------------------------
+    log.info("Applying SMOTE to training data (sampling_strategy=0.3)...")
+    log.info(f"Class distribution BEFORE SMOTE: {dict(zip(*np.unique(y_train, return_counts=True)))}")
+
+    try:
+        smote = SMOTE(sampling_strategy=0.3, random_state=42, n_jobs=-1)
+        X_train, y_train = smote.fit_resample(X_train, y_train)
+        log.info(f"Class distribution AFTER  SMOTE: {dict(zip(*np.unique(y_train, return_counts=True)))}")
+        log.info(f"Training set size after SMOTE: {X_train.shape[0]:,} samples")
+    except Exception as e:
+        log.warning(f"SMOTE failed ({e}) — training on original imbalanced data")
+
     # --- Train all candidate models ---
     results = []
     for name, estimator in build_models():
@@ -331,21 +347,21 @@ def train(data_csv: Path = DATA_CSV):
 
     # Check target thresholds
     if best["metrics"]["recall"] >= 0.90:
-        log.info("✓ Phishing Recall target (≥0.90) ACHIEVED")
+        log.info("âœ“ Phishing Recall target (â‰¥0.90) ACHIEVED")
     else:
-        log.warning(f"✗ Phishing Recall target NOT achieved ({best['metrics']['recall']:.4f} < 0.90)")
+        log.warning(f"âœ— Phishing Recall target NOT achieved ({best['metrics']['recall']:.4f} < 0.90)")
 
     if best["metrics"]["fpr"] <= 0.05:
-        log.info("✓ FPR target (≤0.05) ACHIEVED")
+        log.info("âœ“ FPR target (â‰¤0.05) ACHIEVED")
     else:
-        log.warning(f"✗ FPR target NOT achieved ({best['metrics']['fpr']:.4f} > 0.05)")
+        log.warning(f"âœ— FPR target NOT achieved ({best['metrics']['fpr']:.4f} > 0.05)")
 
     # --- Save artefacts ---
     joblib.dump(best["model"], MODEL_PATH)
-    log.info(f"Saved model → {MODEL_PATH}")
+    log.info(f"Saved model â†’ {MODEL_PATH}")
 
     joblib.dump(text_extractor, TFIDF_PATH)
-    log.info(f"Saved TF-IDF extractor → {TFIDF_PATH}")
+    log.info(f"Saved TF-IDF extractor â†’ {TFIDF_PATH}")
 
     # --- Save metrics summary ---
     metrics_path = MODELS_DIR / "training_metrics.json"
@@ -356,7 +372,7 @@ def train(data_csv: Path = DATA_CSV):
     }
     with open(metrics_path, "w") as f:
         json.dump(all_metrics_with_best, f, indent=2)
-    log.info(f"Saved metrics → {metrics_path}")
+    log.info(f"Saved metrics â†’ {metrics_path}")
 
     log.info("\nTraining complete.")
     return best["model"], text_extractor, results
@@ -373,3 +389,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     train(data_csv=Path(args.data))
+
