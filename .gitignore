@@ -16,3 +16,5 @@ ml/models/training_metrics.json
 .idea/
 .DS_Store
 Thumbs.db
+
+.tmp.driveupload/
