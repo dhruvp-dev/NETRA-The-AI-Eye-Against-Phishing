@@ -173,6 +173,17 @@ def load_models():
 
     _load_thresholds()
 
+    # Auto-download trained weights if missing (e.g. for teammates cloning fresh repo)
+    if not DISTILBERT_MODEL_PATH.exists():
+        log.info("distilbert_tier1.pt not found locally. Downloading from official GitHub Release (v2.0.0)...")
+        try:
+            import urllib.request
+            RELEASE_URL = "https://github.com/ramanan-2735/NETRA-The-AI-Eye-Against-Phishing/releases/download/v2.0.0/distilbert_tier1.pt"
+            urllib.request.urlretrieve(RELEASE_URL, str(DISTILBERT_MODEL_PATH))
+            log.info("distilbert_tier1.pt downloaded successfully from GitHub Release!")
+        except Exception as e:
+            log.warning(f"Failed to auto-download model from GitHub: {e}")
+
     # --- Try DistilBERT first ---
     if DISTILBERT_CONFIG_PATH.exists() and DISTILBERT_MODEL_PATH.exists() and DISTILBERT_TOKENIZER_PATH.exists():
         try:
