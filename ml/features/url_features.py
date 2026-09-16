@@ -68,6 +68,9 @@ def check_typosquatting(domain: str) -> Tuple[int, float]:
         stripped = c.replace("-", "").replace("_", "")
         if stripped not in expanded:
             expanded.append(stripped)
+        for sub in re.split(r"[-_]", c):
+            if sub and sub not in expanded:
+                expanded.append(sub)
 
     min_dist = 1.0
     for candidate in expanded:
@@ -81,7 +84,8 @@ def check_typosquatting(domain: str) -> Tuple[int, float]:
             if norm < min_dist:
                 min_dist = norm
 
-    flag = 1 if min_dist < 0.25 else 0
+    # A distance of 0.0 is an exact legitimate brand domain, NOT typosquatting
+    flag = 1 if 0.0 < min_dist < 0.25 else 0
     return flag, round(min_dist, 4)
 
 
