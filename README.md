@@ -1,193 +1,207 @@
 # 🛡️ NETRA — The AI Eye Against Phishing
 
-> **An Intelligent Multi-Tier Phishing Email Detection System**  
-> Classifies emails in real-time as **LEGITIMATE**, **SUSPICIOUS**, or **PHISHING**.
+> **State-of-the-Art Multi-Signal Deep Learning Phishing Detection Engine**  
+> Powered by Fine-Tuned **DistilBERT** (66M Parameters), RFC Header Authentication Analysis, and Inline Domain Typosquatting Defense.
 
 ---
 
-## 📌 Table of Contents
-1. [Overview & Architecture](#-overview--architecture)
-2. [Option A: Quick Start (Run Pre-trained API)](#-option-a-quick-start-run-pre-trained-api)
-3. [Option B: Train on Local GPU (RTX 3050 / GTX / RTX)](#-option-b-train-on-local-gpu-nvidia-rtx-3050--gtx--rtx)
-4. [Option C: Train on Google Colab (Free T4 Cloud GPU)](#-option-c-train-on-google-colab-free-cloud-t4-gpu)
-5. [Testing the API](#-testing-the-api)
-6. [Live Threshold Tuning](#-live-threshold-tuning-during-demos)
+## 📋 Table of Contents
+1. [Overview & Detection Pipeline](#-overview--detection-pipeline)
+2. [Quick Start — Run the API in 3 Minutes](#-quick-start--run-the-api-in-3-minutes)
+3. [Interactive Web UI Testing (/docs)](#-interactive-web-ui-testing-docs)
+4. [Sample Test Cases (Copy & Paste Ready)](#-sample-test-cases)
+   - [Test 1: Normal Safe Email (LEGITIMATE)](#test-1-normal-safe-email)
+   - [Test 2: Urgent Credential Harvest (PHISHING)](#test-2-urgent-credential-harvest)
+   - [Test 3: Fake Corporate Alert (SUSPICIOUS)](#test-3-fake-corporate-alert)
+5. [How to Train the Model (Google Colab & Local GPU)](#-how-to-train-the-model)
+6. [API Endpoints Reference](#-api-endpoints-reference)
 7. [Project Structure](#-project-structure)
 
 ---
 
-## 🏗️ Overview & Architecture
+## 🧠 Overview & Detection Pipeline
 
-NETRA uses a **two-tier machine learning pipeline** to evaluate email body text, URL signals, and SPF/DKIM/DMARC authentication headers:
-
-- 🟢 **LEGITIMATE (Score < 0.08)** — Safe email, normal business language.
-- 🟡 **SUSPICIOUS (Score 0.08 – 0.25)** — Borderline signals, missing headers, or potential typosquatting.
-- 🔴 **PHISHING (Score > 0.25)** — High-risk attack, fake domain, failed authentication.
+NETRA delivers sub-200ms real-time email security by combining semantic transformer embeddings with cryptographic and lexical heuristics:
 
 ```
-[Incoming Email Payload]
-          │
-          ├──> 1. Header Auth Check (SPF / DKIM / DMARC)
-          ├──> 2. URL Inspection (Typosquatting: paypa1, micros0ft, etc.)
-          └──> 3. Text Intent Engine (DistilBERT / Random Forest)
-          │
-          ▼
-   [ Prediction: LEGITIMATE / SUSPICIOUS / PHISHING ]
+[ Incoming Email (Subject, Body, Sender, Headers) ]
+                      │
+     ┌────────────────┴────────────────────────┐
+     ▼                                         ▼
+[ DistilBERT Transformer ]         [ Multi-Signal Security Heuristics ]
+ • 66M Parameter Base               • SPF / DKIM / DMARC Header Auth
+ • Contextual Text Semantics        • Typosquatting Engine (Levenshtein)
+ • Fine-Tuned on 180k+ emails       • Suspicious TLD & HTTP URL Parser
+     └────────────────┬────────────────────────┘
+                      ▼
+       [ Multi-Signal Fusion Engine ]
+                      │
+   ┌──────────────────┼──────────────────┐
+   ▼                  ▼                  ▼
+🟢 LEGITIMATE      🟡 SUSPICIOUS      🔴 PHISHING
+(Score < 0.08)    (Score 0.08–0.25)   (Score >= 0.25)
 ```
+
+- **Validation F1 Score:** `0.8114`
+- **False Positive Rate (FPR):** `0.0010` (Only **0.1%** false alarms!)
+- **Latency:** ~180 ms per inference.
 
 ---
 
-## ⚡ Option A: Quick Start (Run Pre-trained API)
+## ⚡ Quick Start — Run the API in 3 Minutes
 
-Follow these steps to get the API running locally in **less than 3 minutes**:
+Follow these simple steps to run the server on your computer:
 
-### Step 1: Clone the Repository
-Open your terminal or PowerShell:
+### Step 1: Clone Repository
 ```bash
 git clone https://github.com/ramanan-2735/NETRA-The-AI-Eye-Against-Phishing.git
 cd NETRA-The-AI-Eye-Against-Phishing
 ```
 
-### Step 2: Install Dependencies
+### Step 2: Install Requirements
+Ensure you have Python 3.10+ installed:
 ```bash
 pip install -r requirements.txt
 ```
 
-### Step 3: Verify Model Artifacts
-Ensure the following files exist in `ml/models/`:
-- `tier1_model_calibrated.pkl`
-- `tfidf_vectorizer.pkl`
-- `threshold_config.json`
-
-*(Note: These basic models are already included in the repo. For maximum accuracy, train DistilBERT using Option B or C).*
-
-### Step 4: Start the API Server
+### Step 3: Start the Backend Server
 ```bash
-uvicorn api.main:app --host 127.0.0.1 --port 8000
+python -m uvicorn api.main:app --reload --port 8000
 ```
-Your API is now live at `http://127.0.0.1:8000`! You can view the interactive Swagger docs at `http://127.0.0.1:8000/docs`.
+*(On Windows with Python launcher, you can also use `py -3.14 -m uvicorn api.main:app --reload --port 8000`)*
+
+The server will initialize:
+```text
+============================================================
+NETRA — AI-Powered Phishing Detection Engine starting up...
+============================================================
+Thresholds loaded: phishing>=0.2500 | suspicious [0.0800, 0.2500)
+DistilBERT model loaded successfully.
+Active model: distilbert | Status: Ready
+Uvicorn running on http://127.0.0.1:8000
+```
 
 ---
 
-## 💻 Option B: Train on Local GPU (NVIDIA RTX 3050 / GTX / RTX)
+## 🌐 Interactive Web UI Testing (/docs)
 
-If you have a gaming laptop or PC with an **NVIDIA GPU (e.g., RTX 3050)**, you can train the **DistilBERT Transformer model** locally without using Google Colab.
+NETRA provides a complete, interactive Swagger interface:
 
-### Step 1: Install PyTorch with CUDA Support
-Make sure PyTorch is configured to use your NVIDIA graphics card:
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-
-### Step 2: Verify Your GPU
-Run this quick Python command to confirm PyTorch detects your GPU:
-```bash
-python -c "import torch; print('CUDA Available:', torch.cuda.is_available()); print('GPU Detected:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')"
-```
-> **Expected Output:** `GPU Detected: NVIDIA GeForce RTX 3050 ...`
-
-### Step 3: Run the Data Pipeline
-Processes the raw datasets into `data/processed/unified.csv`:
-```bash
-python ml/data_pipeline.py
-```
-
-### Step 4: Run DistilBERT Fine-Tuning
-Start training the transformer model:
-```bash
-python ml/train_distilbert.py
-```
-- **Training Time:** ~10 to 15 minutes on an RTX 3050.
-- **What Happens Automatically:** The script trains for 3 epochs and saves `distilbert_tier1.pt`, `distilbert_tokenizer/`, and `distilbert_config.json` straight into `ml/models/`.
-
-### Step 5: Start Server with Your New Model
-```bash
-uvicorn api.main:app --host 127.0.0.1 --port 8000
-```
-FastAPI will print `Active model: distilbert` on startup!
+1. Open your browser to: **[http://localhost:8000/docs](http://localhost:8000/docs)**
+2. Click **`POST /predict`** ➔ Click **Try it out**.
+3. Paste any sample email from the section below and click **Execute**!
 
 ---
 
-## ☁️ Option C: Train on Google Colab (Free Cloud T4 GPU)
+## 🧪 Sample Test Cases
 
-If you don't have an NVIDIA GPU on your laptop, use Google Colab for free:
+You can test these directly in Swagger UI or via cURL / PowerShell:
 
-1. Open **[Google Colab](https://colab.research.google.com/)**.
-2. Click **Upload** and select `notebooks/NETRA_DistilBERT_Training.ipynb` from your local repo.
-3. Change runtime setting:
-   > Go to **Runtime** ➔ **Change runtime type** ➔ Select **T4 GPU** ➔ Click **Save**.
-4. Run the entire notebook:
-   > Click **Runtime** ➔ **Run all** (or press `Ctrl + F9`).
-5. **Download Artifacts:** Once training finishes (~25 min), 3 files will download to your browser:
-   - `distilbert_tier1.pt`
-   - `distilbert_tokenizer.zip` *(extract into a folder named `distilbert_tokenizer/`)*
-   - `distilbert_config.json`
-6. Move all 3 files into your local `ml/models/` directory and restart uvicorn.
+### Test 1: Normal Safe Email
+**Expected Verdict:** `LEGITIMATE` (Score: ~0.0000, Risk: LOW)
+```json
+{
+  "subject": "Weekly project status update and meeting minutes",
+  "body_text": "Hi team, please find attached the weekly notes and roadmap review for sprint 14. Next sync will be on Friday at 10 AM.",
+  "sender": "sarah.connor@cyberdyne.com"
+}
+```
 
 ---
 
-## 🧪 Testing the API
-
-### 1. Run Automated Test Suite
-We included 5 graded test cases ranging from clean emails to phishing attacks:
-```bash
-python scratch/test_v2.py
+### Test 2: Urgent Credential Harvest
+**Expected Verdict:** `PHISHING` (Score: > 0.95, Risk: CRITICAL)
+```json
+{
+  "subject": "URGENT: Unauthorized login detected on your PayPal account!",
+  "body_text": "Dear valued user, an unknown login attempt from Russia was detected. Verify your credentials immediately at http://paypal-security-verification.tk/login or your account will be permanently closed within 24 hours.",
+  "sender": "service@paypa1-security.com"
+}
 ```
 
-### 2. Manual cURL Test (Phishing Sample)
-```bash
-curl -X POST http://127.0.0.1:8000/predict \
-  -H "Content-Type: application/json" \
+---
+
+### Test 3: Fake Corporate Alert
+**Expected Verdict:** `SUSPICIOUS` (Score: 0.08 – 0.25, Risk: MEDIUM)
+```json
+{
+  "subject": "Password expiry notification for user",
+  "body_text": "Your Microsoft Office 365 password expires today. Click here to retain your current password: http://login-microsoftonline.ml/auth",
+  "sender": "admin@micros0ft-support.net",
+  "headers": {
+    "spf": "fail",
+    "dkim": "fail",
+    "dmarc": "fail"
+  }
+}
+```
+
+---
+
+## 🖥️ Testing via Command Line (cURL)
+
+In PowerShell or Linux/macOS terminal:
+
+```powershell
+curl.exe -X POST "http://localhost:8000/predict" `
+  -H "Content-Type: application/json" `
   -d '{
-    "body_text": "URGENT: Your account access has been restricted. Verify immediately.",
-    "urls": ["http://paypa1-security-check.example.tk/login"],
-    "sender": "security@paypa1-alert.com",
-    "headers": {"spf": "fail", "dkim": "fail", "dmarc": "fail"}
+    "subject": "URGENT: Your PayPal Account has been suspended!",
+    "body_text": "Please verify your account immediately at http://paypal-security-update.tk",
+    "sender": "service@paypa1-security.com"
   }'
 ```
 
 ---
 
-## 🌡️ Live Threshold Tuning (During Demos)
+## 🏋️ How to Train the Model
 
-You can adjust classification boundaries in real-time **without restarting the server**:
+### Option A: Free Google Colab (Recommended)
+1. Go to [colab.research.google.com](https://colab.research.google.com).
+2. Click **GitHub tab** ➔ Paste: `https://github.com/ramanan-2735/NETRA-The-AI-Eye-Against-Phishing`
+3. Select `notebooks/NETRA_DistilBERT_Training.ipynb`.
+4. Select **Runtime ➔ Change runtime type ➔ T4 GPU**.
+5. Click **Runtime ➔ Run all**.
+6. The notebook will fine-tune DistilBERT in ~25 minutes and automatically download `distilbert_tier1.pt` and `distilbert_tokenizer.zip`.
 
+### Option B: Local NVIDIA GPU (RTX 3050 / RTX 40-series)
+If you have a dedicated NVIDIA GPU:
 ```bash
-curl -X POST http://127.0.0.1:8000/admin/recalibrate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "suspicious_lower": 0.08,
-    "suspicious_upper": 0.25,
-    "phishing_threshold": 0.25
-  }'
+python ml/train_distilbert.py --epochs 3 --batch_size 16 --fp16
 ```
+
+---
+
+## 📡 API Endpoints Reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Returns active model status (`distilbert`), thresholds, and health. |
+| `POST` | `/predict` | Evaluates email subject, body, sender, and headers. |
+| `POST` | `/admin/recalibrate` | Live tuning of detection thresholds without server restart. |
+| `GET` | `/docs` | Interactive Swagger OpenAPI UI. |
 
 ---
 
 ## 📁 Project Structure
 
-```
+```text
 NETRA/
 ├── api/
-│   └── main.py                  # FastAPI inference server & endpoints
+│   └── main.py                   # FastAPI application with multi-signal fusion
 ├── ml/
 │   ├── features/
-│   │   ├── url_features.py      # URL signals & typosquatting detection
-│   │   ├── header_features.py   # SPF/DKIM/DMARC header parsing
-│   │   └── text_features.py     # TF-IDF vector building
-│   ├── models/                  # Saved weights (.pkl & .pt files)
-│   ├── data_pipeline.py         # Raw data ingestion & dataset builder
-│   ├── train.py                 # Phase 1 Random Forest training
-│   ├── train_distilbert.py      # Phase 2 Local DistilBERT GPU training
-│   └── calibrate_threshold.py   # Threshold optimization sweeper
+│   │   ├── header_features.py    # SPF, DKIM, DMARC parsing
+│   │   ├── text_features.py      # Urgency keywords & lexical statistics
+│   │   └── url_features.py       # Levenshtein typosquatting & TLD engine
+│   ├── models/
+│   │   ├── distilbert_config.json # Model metadata, F1 metrics & thresholds
+│   │   ├── distilbert_tokenizer/  # Production tokenizer vocabulary
+│   │   └── distilbert_tier1.pt    # PyTorch trained weights checkpoint
+│   ├── data_pipeline.py          # Unified data processor
+│   └── train_distilbert.py       # Local GPU training script
 ├── notebooks/
-│   └── NETRA_DistilBERT_Training.ipynb  # Cloud Colab training notebook
-├── scratch/
-│   └── test_v2.py               # Automated 5-case test runner
-└── requirements.txt             # Project dependencies
+│   └── NETRA_DistilBERT_Training.ipynb # One-click Google Colab notebook
+├── requirements.txt              # Production dependencies
+└── README.md                     # Documentation
 ```
-
----
-
-## 📄 License
-Distributed under the **MIT License**. Free for academic and personal security research.

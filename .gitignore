@@ -18,3 +18,5 @@ ml/models/training_metrics.json
 Thumbs.db
 
 .tmp.driveupload/
+ml/models/*.pt
+ml/models/*.bin
