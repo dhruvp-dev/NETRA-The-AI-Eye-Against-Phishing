@@ -179,13 +179,13 @@ def load_models():
                 def __init__(self):
                     super().__init__()
                     self.distilbert = DistilBertModel.from_pretrained("distilbert-base-uncased")
-                    self.header_projection = nn.Linear(10, 32)
+                    self.header_proj = nn.Linear(10, 32)
                     self.classifier = nn.Sequential(
                         nn.Linear(768 + 32, 256), nn.ReLU(), nn.Dropout(0.3), nn.Linear(256, 2)
                     )
                 def forward(self, input_ids, attention_mask, header_features):
                     cls = self.distilbert(input_ids, attention_mask).last_hidden_state[:, 0, :]
-                    hdr = torch.relu(self.header_projection(header_features))
+                    hdr = torch.relu(self.header_proj(header_features))
                     return self.classifier(torch.cat([cls, hdr], dim=1))
 
             db_model = PhishingClassifier()
