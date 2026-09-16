@@ -226,6 +226,7 @@ def load_models():
 # Request / Response schemas
 # ---------------------------------------------------------------------------
 class PredictRequest(BaseModel):
+    subject: Optional[str] = None
     body_text: str = Field(..., description="Full email body text")
     urls: Optional[List[str]] = Field(default=[], description="URLs extracted from email")
     sender: Optional[str]     = Field(default=None)
@@ -435,8 +436,27 @@ def _predict_distilbert(req: PredictRequest) -> dict:
     max_len     = state.db_config.get("max_length", 256)
     conf_thresh = state.db_config.get("confidence_threshold", 0.70)
 
+    # Format input text with Subject, Body, and URLs to match training dataset structure
+    import re
+    text_parts = []
+    subject = getattr(req, 'subject', '') or ''
+    if subject.strip():
+        text_parts.append(f'Subject: {subject.strip()}')
+        text_parts.append(f"Subject: {req.subject.strip()}")
+    if req.body_text and req.body_text.strip():
+        text_parts.append(f"Body: {req.body_text.strip()}")
+
+    # Include detected URLs as signals in the prompt
+    all_urls = list(req.urls or [])
+    if req.body_text:
+        all_urls.extend(re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', req.body_text))
+    for u in set(all_urls):
+        text_parts.append(f"Phishing URL: {u}")
+
+    model_input_text = "\n".join(text_parts) if text_parts else (req.body_text or "")
+
     enc = state.db_tokenizer(
-        req.body_text or "",
+        model_input_text,
         max_length=max_len, truncation=True, padding="max_length", return_tensors="pt"
     )
 
@@ -454,12 +474,29 @@ def _predict_distilbert(req: PredictRequest) -> dict:
         confidence = float(max(proba))
         pt         = state.phishing_threshold
 
-        if confidence < conf_thresh:
+        # If model is uncertain or score falls into suspicious corridor
+        if confidence < conf_thresh or (state.suspicious_lower <= risk_score < pt):
             cls = "SUSPICIOUS"
-        elif proba[1] > proba[0]:
+        elif proba[1] > proba[0] or risk_score >= pt:
             cls = "PHISHING"
         else:
             cls = "LEGITIMATE"
+
+    # Multi-signal override: If deep learning scored low but multiple high-confidence
+    # threat signals were detected (e.g. typosquatted domain + failed headers or malicious URLs)
+    signals = _extract_signals(req)
+    high_threat_signals = (
+        int(signals.get("typosquatting_detected", False)) +
+        int(signals.get("header_auth_failed", False)) +
+        min(signals.get("suspicious_urls", 0), 2)
+    )
+
+    if cls == "LEGITIMATE" and high_threat_signals >= 2:
+        cls = "SUSPICIOUS"
+        risk_score = max(risk_score, 0.18)  # Elevate into suspicious corridor
+    elif cls == "LEGITIMATE" and high_threat_signals >= 3:
+        cls = "PHISHING"
+        risk_score = max(risk_score, 0.75)
 
     return {
         "classification": cls,
