@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "NETRA — The AI Eye Against Phishing",
+  "version": "2.0.0",
+  "description": "State-of-the-Art Deep Learning Phishing & Typosquatting Detection Engine powered by DistilBERT.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "netra-phishing-detector@local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "storage",
+    "contextMenus",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "NETRA Phishing Scanner",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "background": {
+    "scripts": ["service-worker.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}
