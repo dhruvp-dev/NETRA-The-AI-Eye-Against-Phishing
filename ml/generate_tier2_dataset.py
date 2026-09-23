@@ -77,7 +77,7 @@ def load_tier1_model(device):
         def __init__(self):
             super().__init__()
             self.distilbert = DistilBertModel.from_pretrained("distilbert-base-uncased")
-            self.header_projection = nn.Linear(10, 32)
+            self.header_proj = nn.Linear(10, 32)
             self.classifier = nn.Sequential(
                 nn.Linear(768 + 32, 256),
                 nn.ReLU(),
@@ -88,7 +88,7 @@ def load_tier1_model(device):
         def forward(self, input_ids, attention_mask, header_features):
             db_output = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
             cls_output = db_output.last_hidden_state[:, 0, :]
-            header_proj = torch.relu(self.header_projection(header_features))
+            header_proj = torch.relu(self.header_proj(header_features))
             combined = torch.cat([cls_output, header_proj], dim=1)
             return self.classifier(combined)
 
