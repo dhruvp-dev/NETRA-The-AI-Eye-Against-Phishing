@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 NETRA - FastAPI Inference Server v2
 =====================================
@@ -49,6 +49,7 @@ THRESHOLD_CONFIG_PATH  = MODELS_DIR / "threshold_config.json"
 DISTILBERT_CONFIG_PATH = MODELS_DIR / "distilbert_config.json"
 DISTILBERT_MODEL_PATH  = MODELS_DIR / "distilbert_tier1.pt"
 DISTILBERT_TOKENIZER_PATH = MODELS_DIR / "distilbert_tokenizer"
+TIER2_CONFIG_PATH = MODELS_DIR / "tier2_config.json"
 
 # ---------------------------------------------------------------------------
 # Safe defaults (matches manual_empirical_v2 patch)
@@ -108,6 +109,11 @@ class ModelState:
     db_tokenizer     = None
     db_config: dict  = {}
     db_ready: bool   = False
+
+    # Tier-2 state
+    tier2_client = None
+    tier2_enabled: bool = False
+    tier2_config: dict  = {}
 
     # Active thresholds
     phishing_threshold: float  = DEFAULT_PHISHING_THRESHOLD
@@ -230,6 +236,24 @@ def load_models():
         except Exception as e:
             log.error(f"RF model load failed: {e}")
 
+    
+    # --- Load Tier-2 config (if available) ---
+    if TIER2_CONFIG_PATH.exists():
+        try:
+            with open(TIER2_CONFIG_PATH) as f:
+                state.tier2_config = json.load(f)
+            import os
+            tier2_url = os.getenv("NETRA_TIER2_URL", "")
+            if tier2_url:
+                from api.tier2_client import Tier2Client
+                state.tier2_client = Tier2Client(base_url=tier2_url)
+                state.tier2_enabled = True
+                log.info(f"Tier-2 escalation enabled: {tier2_url}")
+            else:
+                log.info("Tier-2 config found but NETRA_TIER2_URL not set - escalation disabled")
+        except Exception as e:
+            log.warning(f"Tier-2 config load failed: {e}")
+
     log.info(f"Active model: {state.model_type} | Loaded: {state.model_loaded}")
 
 
@@ -278,6 +302,10 @@ class PredictResponse(BaseModel):
     threshold_used: float
     signals: SignalsDict
     processing_time_ms: float
+    escalated_to_tier2: bool = False
+    tier2_verdict: Optional[str] = None
+    tier2_confidence: Optional[float] = None
+    tier2_xai_tokens: Optional[list] = None
 
 
 class HealthResponse(BaseModel):
@@ -453,7 +481,6 @@ def _predict_distilbert(req: PredictRequest) -> dict:
     subject = getattr(req, 'subject', '') or ''
     if subject.strip():
         text_parts.append(f'Subject: {subject.strip()}')
-        text_parts.append(f"Subject: {req.subject.strip()}")
     if req.body_text and req.body_text.strip():
         text_parts.append(f"Body: {req.body_text.strip()}")
 
@@ -516,6 +543,47 @@ def _predict_distilbert(req: PredictRequest) -> dict:
         "threshold_used": round(pt, 4),
     }
 
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 Escalation Logic
+# ---------------------------------------------------------------------------
+def should_escalate(tier1_result: dict, signals: dict) -> bool:
+    """
+    Decide if this email should be escalated to Tier-2 for deeper analysis.
+    Uses production escalation policy (tighter than training corridor).
+    """
+    if not state.tier2_enabled:
+        return False
+
+    policy = state.tier2_config.get("escalation_policy", {})
+    lower  = policy.get("suspicious_lower", 0.08)
+    upper  = policy.get("suspicious_upper", 0.25)
+    conf_thresh = policy.get("confidence_threshold", 0.70)
+
+    verdict    = tier1_result["classification"]
+    risk_score = tier1_result["risk_score"]
+    confidence = tier1_result["confidence"]
+
+    # Always escalate SUSPICIOUS
+    if verdict == "SUSPICIOUS":
+        return True
+
+    # Escalate uncertain PHISHING
+    if verdict == "PHISHING" and confidence < conf_thresh:
+        return True
+
+    # Escalate LEGITIMATE with conflicting threat signals
+    if verdict == "LEGITIMATE":
+        signal_count = (
+            int(signals.get("typosquatting_detected", False)) +
+            int(signals.get("header_auth_failed", False)) +
+            min(signals.get("suspicious_urls", 0), 2)
+        )
+        if signal_count >= 1:
+            return True
+
+    return False
 
 # ---------------------------------------------------------------------------
 # Endpoints
