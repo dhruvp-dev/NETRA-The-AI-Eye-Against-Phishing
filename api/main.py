@@ -631,15 +631,41 @@ async def predict(req: PredictRequest):
                  f"auth_fail={signals['header_auth_failed']} "
                  f"elapsed={elapsed}ms")
 
+        # Check for Tier-2 Escalation
+        escalated = False
+        t2_res = None
+        if should_escalate(result, signals) and state.tier2_enabled and state.tier2_client:
+            log.info(f"Escalating email to Tier-2 service (verdict={result['classification']}, score={result['risk_score']:.4f})...")
+            t2_payload = {
+                "subject": getattr(req, "subject", "") or "",
+                "body_text": req.body_text,
+                "urls": req.urls or [],
+                "sender": req.sender or "",
+                "reply_to": req.reply_to or "",
+                "headers_available": req.headers or {},
+                "tier1_risk_score": result["risk_score"],
+                "tier1_confidence": result["confidence"],
+                "tier1_verdict": result["classification"],
+                "tier1_signals": signals,
+            }
+            t2_res = await state.tier2_client.predict(t2_payload)
+            if t2_res:
+                escalated = True
+                log.info(f"Tier-2 resolved: verdict={t2_res.get('verdict')}, conf={t2_res.get('confidence')}")
+
         return PredictResponse(
-            classification   = result["classification"],
-            risk_score       = result["risk_score"],
-            confidence       = result["confidence"],
-            risk_level       = _risk_level(result["risk_score"]),
-            model_type       = state.model_type,
-            threshold_used   = result["threshold_used"],
-            signals          = SignalsDict(**signals),
+            classification     = t2_res.get("verdict", result["classification"]) if t2_res else result["classification"],
+            risk_score         = t2_res.get("risk_score", result["risk_score"]) if t2_res else result["risk_score"],
+            confidence         = t2_res.get("confidence", result["confidence"]) if t2_res else result["confidence"],
+            risk_level         = _risk_level(t2_res.get("risk_score", result["risk_score"]) if t2_res else result["risk_score"]),
+            model_type         = "distilbert+roberta_tier2" if escalated else state.model_type,
+            threshold_used     = result["threshold_used"],
+            signals            = SignalsDict(**signals),
             processing_time_ms = elapsed,
+            escalated_to_tier2 = escalated,
+            tier2_verdict      = t2_res.get("verdict") if t2_res else None,
+            tier2_confidence   = t2_res.get("confidence") if t2_res else None,
+            tier2_xai_tokens   = [t.dict() if hasattr(t, 'dict') else t for t in t2_res.get("top_tokens", [])] if t2_res else None,
         )
 
     except Exception as e:
