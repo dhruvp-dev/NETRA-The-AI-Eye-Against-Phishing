@@ -93,7 +93,15 @@ def load_tier1_model(device):
             return self.classifier(combined)
 
     model = PhishingClassifier()
-    model.load_state_dict(torch.load(DISTILBERT_PATH, map_location=device, weights_only=True))
+    state_dict = torch.load(DISTILBERT_PATH, map_location=device, weights_only=True)
+    # Ensure compatibility whether saved with header_proj or header_projection
+    adapted_sd = {}
+    for k, v in state_dict.items():
+        if k.startswith("header_projection."):
+            adapted_sd[k.replace("header_projection.", "header_proj.")] = v
+        else:
+            adapted_sd[k] = v
+    model.load_state_dict(adapted_sd, strict=False)
     model.to(device)
     model.eval()
     log.info(f"Tier-1 model loaded on {device}")
