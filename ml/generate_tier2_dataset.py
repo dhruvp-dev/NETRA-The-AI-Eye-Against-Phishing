@@ -173,9 +173,14 @@ def should_escalate(risk_score, confidence, verdict, signals):
     return False
 
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
+def generate_tier2_dataset(data_csv=DATA_CSV, output_csv=OUTPUT_CSV, batch_size=64):
+    """Alias for generate_dataset supporting custom output_csv."""
+    global OUTPUT_CSV
+    if output_csv is not None:
+        OUTPUT_CSV = Path(output_csv)
+    return generate_dataset(data_csv=Path(data_csv), batch_size=batch_size)
+
+
 def generate_dataset(data_csv=DATA_CSV, batch_size=64):
     import torch
 
