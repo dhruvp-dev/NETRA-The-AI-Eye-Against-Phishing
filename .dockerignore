@@ -1,0 +1,37 @@
+# Git & CI/CD
+.git
+.github
+.gitignore
+
+# Virtual Environments
+.venv
+env
+venv
+
+# Byte-compiled / cache files
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+
+# Large model binaries (downloaded directly during Cloud Build from GitHub Releases)
+ml/models/*.pt
+ml/models/*.bin
+ml/models/*.pkl
+
+# Datasets and Notebooks
+data/
+notebooks/
+
+# Documentation & local scripts
+docs/
+generate_repo_report.py
+repository-technical-analysis.pdf
+skills-lock.json
+.agents/
+
+# IDE files
+.vscode
+.idea
+*.swp
+*.swo

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 NETRA - FastAPI Inference Server v2
 =====================================
@@ -33,7 +33,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -86,12 +86,24 @@ NETRA Tier-1 Phishing Detection Pipeline:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost", "http://localhost:3000", "http://127.0.0.1",
-                   "chrome-extension://*"],
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+
+@app.get("/", tags=["health"])
+async def root():
+    return {
+        "service": "NETRA Phishing Detection API",
+        "version": "2.0.0",
+        "status": "online",
+        "docs_url": "/docs",
+        "health_url": "/health",
+        "predict_url": "/predict",
+    }
+
 
 # ---------------------------------------------------------------------------
 # Global model state
@@ -270,6 +282,8 @@ class SignalsDict(BaseModel):
 
 
 class PredictResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     classification: str
     risk_score: float
     confidence: float
@@ -281,6 +295,8 @@ class PredictResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     status: str
     model_type: str
     model_loaded: bool

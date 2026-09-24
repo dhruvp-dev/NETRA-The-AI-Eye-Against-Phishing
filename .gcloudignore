@@ -1,0 +1,35 @@
+# Files to ignore when uploading source to Google Cloud Build
+.gcloudignore
+.git
+.github
+.gitignore
+.venv/
+env/
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Large model binaries (downloaded in Cloud Build directly from GitHub Release)
+ml/models/*.pt
+ml/models/*.bin
+ml/models/*.pkl
+
+# Data & Notebooks
+data/
+notebooks/
+
+# Local documents and reports
+docs/
+generate_repo_report.py
+repository-technical-analysis.pdf
+skills-lock.json
+.agents/
+
+# Editor files
+.vscode/
+.idea/

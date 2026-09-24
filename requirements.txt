@@ -17,8 +17,12 @@ imbalanced-learn==0.12.3
 pandas==2.2.3
 numpy==1.26.4
 
-# --- NLP ---
+# --- NLP & Deep Learning ---
 nltk==3.9.1
+torch>=2.0.0
+transformers>=4.30.0
+scipy>=1.10.0
+
 
 # --- Dev / Test ---
 pytest==8.3.3
