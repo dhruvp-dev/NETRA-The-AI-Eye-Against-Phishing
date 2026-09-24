@@ -46,6 +46,19 @@ gcloud services enable \
     cloudbuild.googleapis.com \
     artifactregistry.googleapis.com
 
+# Automatically fix Cloud Build default service account IAM permissions
+echo "⏳ Configuring Cloud Build service account permissions..."
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+for ROLE in "roles/storage.admin" "roles/artifactregistry.writer" "roles/logging.logWriter"; do
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:${COMPUTE_SA}" \
+        --role="$ROLE" \
+        --condition=None \
+        --quiet >/dev/null 2>&1 || true
+done
+
 echo "🚀 Submitting build to Cloud Build and deploying to Cloud Run..."
 echo "   (Remote cloud build: no local Docker daemon needed)"
 echo ""
