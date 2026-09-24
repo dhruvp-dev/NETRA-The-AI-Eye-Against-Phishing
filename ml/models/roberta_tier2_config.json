@@ -1,0 +1,30 @@
+{
+  "model_name": "roberta-base",
+  "num_classes": 3,
+  "max_length": 512,
+  "class_names": [
+    "LEGITIMATE",
+    "SUSPICIOUS",
+    "PHISHING"
+  ],
+  "header_features": [
+    "spf_pass",
+    "spf_fail",
+    "spf_none",
+    "dkim_pass",
+    "dkim_fail",
+    "dkim_none",
+    "dmarc_pass",
+    "dmarc_fail",
+    "dmarc_none",
+    "sender_domain_match"
+  ],
+  "thresholds": {
+    "suspicious_lower": 0.35,
+    "phishing_lower": 0.65
+  },
+  "metrics": {
+    "test_accuracy": 0.9408450704225352,
+    "macro_f1": 0.3912023460410557
+  }
+}
