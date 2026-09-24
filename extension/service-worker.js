@@ -2,7 +2,7 @@
  * NETRA Chrome Extension - Background Service Worker (Manifest V3)
  */
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "https://netra-api-h47irmxbha-el.a.run.app";
 
 chrome.runtime.onInstalled.addListener(() => {
   // Create context menus for quick scanning

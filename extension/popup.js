@@ -3,7 +3,7 @@
  * Implements ClickUp-style high-contrast design system interactions.
  */
 
-const API_BASE = "http://127.0.0.1:8000";
+let API_BASE = "https://netra-api-h47irmxbha-el.a.run.app";
 
 // DOM Elements
 const inputSender = document.getElementById("input-sender");
@@ -284,7 +284,7 @@ async function runInference(payload) {
     const data = await res.json();
     displayResults(data);
   } catch (err) {
-    alert(`Failed to connect to NETRA backend (${API_BASE}).\nPlease ensure "python -m uvicorn api.main:app --port 8000" is running.`);
+    alert(`Failed to connect to NETRA backend at ${API_BASE}.\nPlease check your network connection or API status.`);
   }
 }
 
