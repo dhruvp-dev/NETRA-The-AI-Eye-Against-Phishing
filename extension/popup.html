@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NETRA — AI Phishing Eye</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="brand-row">
+        <div class="brand-identity">
+          <div class="brand-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#202020" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" stroke="#202020"></path>
+              <circle cx="12" cy="12" r="3.5" fill="#6647f0" stroke="#6647f0"></circle>
+              <circle cx="12" cy="12" r="1.2" fill="#ffffff"></circle>
+            </svg>
+          </div>
+          <h1 class="brand-name">NETRA</h1>
+        </div>
+      </div>
+      <p class="subtitle">Multi-Signal Deep Learning Phishing Defense</p>
+    </header>
+
+    <!-- Email / Phishing Scanner Section -->
+    <section id="panel-email" class="main-form-section">
+      <!-- Auto-Fetch Active Email Button -->
+      <button id="btn-autofetch-email" class="autofetch-pill-btn" type="button">
+        <svg class="pill-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 12h-6l-2 3h-4l-2-3H2"></path>
+          <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path>
+        </svg>
+        <span id="autofetch-btn-text">Auto-Fetch Active Email (Gmail / Outlook)</span>
+      </button>
+
+      <!-- Quick Test Presets -->
+      <div class="presets-row">
+        <span class="mono-label">PRESETS:</span>
+        <button id="preset-safe" class="preset-pill" type="button">
+          <svg class="pill-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+          <span>Safe Email</span>
+        </button>
+        <button id="preset-phish" class="preset-pill" type="button">
+          <svg class="pill-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+          <span>Urgent Phish</span>
+        </button>
+      </div>
+
+      <div class="form-group">
+        <label for="input-sender" class="input-label">Sender Email</label>
+        <input id="input-sender" class="text-input" type="text" placeholder="e.g. security@paypal-verify.tk" />
+      </div>
+
+      <div class="form-group">
+        <label for="input-subject" class="input-label">Subject</label>
+        <input id="input-subject" class="text-input" type="text" placeholder="e.g. URGENT: Unauthorized login detected!" />
+      </div>
+
+      <div class="form-group">
+        <label for="input-body" class="input-label">Body Text / Links</label>
+        <textarea id="input-body" class="text-area" rows="4" placeholder="Paste email content or suspicious message here..."></textarea>
+      </div>
+
+      <button id="btn-scan-email" class="btn-primary-action" type="button">
+        Analyze Email
+      </button>
+    </section>
+
+    <!-- Results Section -->
+    <section id="results-container" class="results-section hidden">
+      <div class="card card-result">
+        <div class="result-header">
+          <div class="verdict-wrapper">
+            <span class="mono-label">DETECTION VERDICT</span>
+            <div id="verdict-pill" class="verdict-pill pill-legit">LEGITIMATE</div>
+          </div>
+          <div class="risk-gauge-box">
+            <span class="mono-label">RISK SCORE</span>
+            <div id="risk-score-val" class="risk-score-value">0.0%</div>
+          </div>
+        </div>
+
+        <div class="progress-bar-bg">
+          <div id="risk-progress-bar" class="progress-bar-fill"></div>
+        </div>
+
+        <!-- Signal Analysis Grid -->
+        <div class="signals-header">
+          <span class="mono-label">HEURISTIC & SEMANTIC SIGNALS</span>
+        </div>
+        <div class="signals-grid">
+          <div id="signal-typo" class="signal-item">
+            <span class="signal-icon">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="12" y1="2" x2="12" y2="6"></line>
+                <line x1="12" y1="18" x2="12" y2="22"></line>
+                <line x1="2" y1="12" x2="6" y2="12"></line>
+                <line x1="18" y1="12" x2="22" y2="12"></line>
+              </svg>
+            </span>
+            <div class="signal-info">
+              <span class="signal-name">Typosquatting</span>
+              <span id="signal-typo-status" class="signal-status">Clean</span>
+            </div>
+          </div>
+
+          <div id="signal-urgency" class="signal-item">
+            <span class="signal-icon">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polyline points="12 6 12 12 16 14"></polyline>
+              </svg>
+            </span>
+            <div class="signal-info">
+              <span class="signal-name">Urgency Intent</span>
+              <span id="signal-urgency-status" class="signal-status">Normal</span>
+            </div>
+          </div>
+
+          <div id="signal-auth" class="signal-item">
+            <span class="signal-icon">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                <polyline points="9 12 11 14 15 10"></polyline>
+              </svg>
+            </span>
+            <div class="signal-info">
+              <span class="signal-name">Header Auth</span>
+              <span id="signal-auth-status" class="signal-status">Passed / N/A</span>
+            </div>
+          </div>
+
+          <div id="signal-urls" class="signal-item">
+            <span class="signal-icon">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+              </svg>
+            </span>
+            <div class="signal-info">
+              <span class="signal-name">Suspicious URLs</span>
+              <span id="signal-urls-status" class="signal-status">0 Detected</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Meta Footer -->
+        <div class="meta-footer">
+          <span class="meta-badge">Inference Latency</span>
+          <span id="inference-time-badge" class="meta-badge">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+            <span id="inference-time-text">0 ms</span>
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Footer Note -->
+    <footer class="footer">
+      <span class="footer-text">Powered by NETRA AI Engine</span>
+      <a href="http://127.0.0.1:8000/docs" target="_blank" class="footer-link">Swagger Docs →</a>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
