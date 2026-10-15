@@ -98,7 +98,7 @@ NETRA provides a complete, interactive Swagger interface:
 You can test these directly in Swagger UI or via cURL / PowerShell:
 
 ### Test 1: Normal Safe Email
-**Expected Verdict:** `LEGITIMATE` (Score: ~0.0000, Risk: LOW)
+**Verdict** (measured with the shipped `distilbert_tier1.pt`): `LEGITIMATE` (Score: 0.0029, Risk: LOW)
 ```json
 {
   "subject": "Weekly project status update and meeting minutes",
@@ -110,7 +110,7 @@ You can test these directly in Swagger UI or via cURL / PowerShell:
 ---
 
 ### Test 2: Urgent Credential Harvest
-**Expected Verdict:** `PHISHING` (Score: > 0.95, Risk: CRITICAL)
+**Verdict** (measured with the shipped `distilbert_tier1.pt`): `PHISHING` (Score: 0.9977, Risk: CRITICAL)
 ```json
 {
   "subject": "URGENT: Unauthorized login detected on your PayPal account!",
@@ -122,7 +122,8 @@ You can test these directly in Swagger UI or via cURL / PowerShell:
 ---
 
 ### Test 3: Fake Corporate Alert
-**Expected Verdict:** `SUSPICIOUS` (Score: 0.08 – 0.25, Risk: MEDIUM)
+**Verdict** (measured with the shipped `distilbert_tier1.pt`): `PHISHING` (Score: 0.9761, Risk: CRITICAL).
+> The shipped weights over-flag this email. The earlier expectation (SUSPICIOUS) was not what the model returns. Re-check this case after retraining.
 ```json
 {
   "subject": "Password expiry notification for user",
@@ -176,10 +177,25 @@ python ml/train_distilbert.py --epochs 3 --batch_size 16 --fp16
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/health` | Returns active model status (`distilbert`), thresholds, and health. |
-| `POST` | `/predict` | Evaluates email subject, body, sender, and headers. |
-| `POST` | `/admin/recalibrate` | Live tuning of detection thresholds without server restart. |
+| `GET` | `/health` | Active model status and thresholds. Returns `503` when no model is loaded. |
+| `POST` | `/predict` | Evaluates email subject, body, sender, and headers. Limited to 20 requests/minute per client. |
+| `POST` | `/admin/recalibrate` | Live threshold update. Requires `Authorization: Bearer <NETRA_ADMIN_TOKEN>`. Returns `404` when the token is not set. |
 | `GET` | `/docs` | Interactive Swagger OpenAPI UI. |
+
+**Environment variables**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NETRA_ADMIN_TOKEN` | unset (admin endpoint disabled) | Bearer token for `/admin/recalibrate`. |
+| `NETRA_TRUSTED_PROXY_HOPS` | `0` | Reverse proxies in front of the API. Cloud Run: `1`. `0` ignores `X-Forwarded-For`. |
+| `NETRA_MAX_CONCURRENCY` | `2` | Maximum concurrent model inferences. |
+
+**Running the tests**
+
+```bash
+pytest tests/                                  # unit and API tests (no weights needed)
+python tests/stress_test_tier1.py              # end-to-end verdicts and latency (needs weights)
+```
 
 ---
 
