@@ -20,3 +20,33 @@ Thumbs.db
 .tmp.driveupload/
 ml/models/*.pt
 ml/models/*.bin
+
+# Secrets and local environments
+.env
+.env.*
+venv/
+.venv/
+
+# Notebook and tool caches
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Model artifacts (anywhere in the repo, not only ml/models/)
+**/*.pt
+**/*.bin
+*.safetensors
+*.onnx
+*.ckpt
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+
+# Local tool state and generated plots
+.claude/settings.local.json
+ml/evaluation/*.png
+
+# Runtime-mutated thresholds (committed defaults live in threshold_config.default.json)
+ml/models/threshold_config.json
+ml/models/threshold_config.json.tmp

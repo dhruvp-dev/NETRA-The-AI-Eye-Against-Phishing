@@ -3,41 +3,38 @@
 NETRA - DistilBERT Tier-1 Training Script
 ==========================================
 Fine-tunes distilbert-base-uncased for phishing detection.
-Designed to run in Google Colab on T4 GPU (~20-25 min).
 
-Run:
-    python ml/train_distilbert.py --data /path/to/unified.csv
+Run (examples):
+    python ml/train_distilbert.py --data data/processed/unified.csv
+    python ml/train_distilbert.py --epochs 3 --batch_size 16 --fp16 --seed 42
 
 Outputs (in ml/models/):
-    distilbert_tier1.pt        -- model weights (~250MB)
+    distilbert_tier1.pt        -- model weights
     distilbert_tokenizer/      -- tokenizer folder
-    distilbert_config.json     -- inference configuration
+    distilbert_config.json     -- inference configuration (merged, existing keys kept)
 
-Architecture:
-    [Email Body Text]
-           |
-    DistilBERT (distilbert-base-uncased)
-           |
-    [CLS] token embedding (768 dims)
-           |                    [Header auth features (10)] --> Linear(10->32) --> ReLU
-    Concatenate [768 + 32 = 800 dims]
-           |
-    Classifier head: Linear(800->256) -> ReLU -> Dropout(0.3) -> Linear(256->2)
-           |
-    [LEGITIMATE / PHISHING]
+Train/serve parity:
+    * Text is built by ml.features.text_builder.build_model_text (same as api/main.py).
+    * Header features come from ml.features.header_features (same as api/main.py).
+    * The architecture is ml.distilbert_model.PhishingClassifier (same as api/main.py).
 
-SUSPICIOUS is an INFERENCE-TIME state only:
-    If max(softmax_probability) < confidence_threshold (0.70):
-        classification = SUSPICIOUS (model is uncertain)
-    else:
-        classification = argmax(probabilities)
+Evaluation:
+    * Checkpoint selection uses VAL only.
+    * Reported test metrics use test_std and test_cross. URL-only rows are excluded
+      because they have no email body and would inflate the scores.
+
+SUSPICIOUS is an INFERENCE-TIME state only (threshold rules live in
+ml/models/threshold_config.json, see api/main.py).
 """
 
-import sys
+import argparse
+import hashlib
 import json
 import logging
-import argparse
+import random
+import sys
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -46,383 +43,335 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
 import numpy as np
 import pandas as pd
+
+from ml.features.header_features import HEADER_FEATURE_NAMES, extract_from_row
+from ml.features.text_builder import build_model_text, extract_urls
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 MODELS_DIR = ROOT / "ml" / "models"
-EVAL_DIR   = ROOT / "ml" / "evaluation"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-EVAL_DIR.mkdir(parents=True, exist_ok=True)
-
+EVAL_DIR = ROOT / "ml" / "evaluation"
 DATA_CSV = ROOT / "data" / "processed" / "unified.csv"
+WEIGHTS_PATH = MODELS_DIR / "distilbert_tier1.pt"
+TOKENIZER_DIR = MODELS_DIR / "distilbert_tokenizer"
+CONFIG_PATH = MODELS_DIR / "distilbert_config.json"
 
 # ---------------------------------------------------------------------------
-# Header feature names (must match header_features.py exactly)
+# Defaults (overridable from the command line)
 # ---------------------------------------------------------------------------
-HEADER_FEATURE_NAMES = [
-    "spf_pass", "spf_fail", "spf_none",
-    "dkim_pass", "dkim_fail", "dkim_none",
-    "dmarc_pass", "dmarc_fail", "dmarc_none",
-    "sender_domain_match",
-]
-
-CONFIDENCE_THRESHOLD = 0.70    # below this -> SUSPICIOUS
-MAX_LENGTH           = 256     # token limit (95th percentile of email body length)
-BATCH_SIZE           = 32      # fits T4 16GB VRAM at max_length=256
-EPOCHS               = 3       # standard for BERT fine-tuning (more = overfitting risk)
-LEARNING_RATE        = 2e-5    # AdamW standard for BERT fine-tuning
-WARMUP_STEPS         = 100
+CONFIDENCE_THRESHOLD = 0.70   # inference-time SUSPICIOUS band (kept for the config file)
+MAX_LENGTH = 256
+BATCH_SIZE = 32
+EPOCHS = 3
+LEARNING_RATE = 2e-5
+WARMUP_RATIO = 0.10
+WEIGHT_DECAY = 0.01
+SEED = 42
+IMBALANCE_WARN_RATIO = 10.0
+TEXT_FORMAT = "v3"            # bump when build_model_text changes
+PRETRAINED = "distilbert-base-uncased"
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Reproducibility and device
 # ---------------------------------------------------------------------------
-class PhishingEmailDataset:
-    """
-    PyTorch Dataset for phishing email classification.
-    Stores pre-tokenized input_ids, attention_mask, header features, and labels.
-    """
+def set_seed(seed: int) -> None:
+    import torch
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    def __init__(self, input_ids, attention_masks, header_features, labels):
-        import torch
-        self.input_ids       = torch.tensor(input_ids,       dtype=torch.long)
-        self.attention_masks = torch.tensor(attention_masks, dtype=torch.long)
-        self.header_features = torch.tensor(header_features, dtype=torch.float32)
-        self.labels          = torch.tensor(labels,          dtype=torch.long)
+
+def pick_device():
+    import torch
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+def _model_text_row(row) -> str:
+    """Build the exact string the API will build for the same email."""
+    try:
+        explicit = json.loads(row.get("urls") or "[]")
+    except (TypeError, ValueError):
+        explicit = []
+    urls = extract_urls(row.get("subject", ""), row.get("body_text", ""), explicit)
+    return build_model_text(row.get("subject", ""), row.get("body_text", ""), urls)
+
+
+def load_split_frame(csv_path: Path, splits):
+    """Load unified.csv and return the requested splits with text, header features, labels."""
+    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    df = df[df["split"].isin(splits)].reset_index(drop=True)
+
+    texts = [_model_text_row(r) for _, r in df.iterrows()]
+    hdr = np.array(
+        [[float(extract_from_row(h, s, r)[k]) for k in HEADER_FEATURE_NAMES]
+         for h, s, r in zip(df["headers_available"], df["sender"], df["reply_to"])],
+        dtype=np.float32,
+    )
+    url_only = df["url_only"].astype(str).str.lower().eq("true").values \
+        if "url_only" in df.columns else np.zeros(len(df), dtype=bool)
+
+    out = pd.DataFrame({
+        "split": df["split"].values,
+        "label": df["label"].astype(int).values,
+        "text": texts,
+        "url_only": url_only,
+    })
+    return out, hdr
+
+
+def class_balance_report(labels, name: str) -> None:
+    n0, n1 = int((labels == 0).sum()), int((labels == 1).sum())
+    log.info(f"{name}: legitimate={n0:,} malicious={n1:,}")
+    if min(n0, n1) == 0:
+        log.warning(f"{name} has a single class; metrics for it are undefined.")
+    elif max(n0, n1) / min(n0, n1) > IMBALANCE_WARN_RATIO:
+        log.warning(f"{name} class ratio above {IMBALANCE_WARN_RATIO:.0f}:1. "
+                    "Check Enron/SpamAssassin ham is included.")
+
+
+class EncodedEmails:
+    """Pre-tokenised (no padding) examples. Padding is done per batch in collate()."""
+
+    def __init__(self, input_ids, header, labels):
+        self.input_ids = input_ids
+        self.header = header
+        self.labels = labels
 
     def __len__(self):
         return len(self.labels)
 
-    def __getitem__(self, idx):
+
+def encode(texts, tokenizer, max_length):
+    enc = tokenizer(texts, truncation=True, max_length=max_length, padding=False)
+    return enc["input_ids"]
+
+
+def make_loader(encoded: EncodedEmails, tokenizer, batch_size, shuffle, num_workers=0):
+    import torch
+    from torch.utils.data import DataLoader, Dataset
+
+    class _DS(Dataset):
+        def __len__(self):
+            return len(encoded)
+
+        def __getitem__(self, i):
+            return encoded.input_ids[i], encoded.header[i], encoded.labels[i]
+
+    def collate(batch):
+        ids, hdr, lab = zip(*batch)
+        padded = tokenizer.pad({"input_ids": list(ids)}, return_tensors="pt")
         return {
-            "input_ids":       self.input_ids[idx],
-            "attention_mask":  self.attention_masks[idx],
-            "header_features": self.header_features[idx],
-            "labels":          self.labels[idx],
+            "input_ids": padded["input_ids"],
+            "attention_mask": padded["attention_mask"],
+            "header_features": torch.tensor(np.stack(hdr), dtype=torch.float32),
+            "labels": torch.tensor(lab, dtype=torch.long),
         }
 
+    return DataLoader(_DS(), batch_size=batch_size, shuffle=shuffle,
+                      collate_fn=collate, num_workers=num_workers)
+
 
 # ---------------------------------------------------------------------------
-# Model
+# Metrics
 # ---------------------------------------------------------------------------
-def build_model():
-    """
-    Custom PhishingClassifier that combines DistilBERT [CLS] embedding
-    with a projected header feature vector before classification.
-    """
+def classification_metrics(labels: np.ndarray, probs: np.ndarray, threshold: float = 0.5) -> dict:
+    from sklearn.metrics import (accuracy_score, average_precision_score, f1_score,
+                                 precision_score, recall_score)
+    preds = (probs >= threshold).astype(int)
+    fp = int(((preds == 1) & (labels == 0)).sum())
+    tn = int(((preds == 0) & (labels == 0)).sum())
+    has_both = len(np.unique(labels)) == 2
+    return {
+        "n": int(len(labels)),
+        "n_legitimate": int((labels == 0).sum()),
+        "n_malicious": int((labels == 1).sum()),
+        "accuracy": round(float(accuracy_score(labels, preds)), 4),
+        "precision": round(float(precision_score(labels, preds, zero_division=0)), 4),
+        "recall": round(float(recall_score(labels, preds, zero_division=0)), 4),
+        "f1": round(float(f1_score(labels, preds, zero_division=0)), 4),
+        "fpr": round(fp / (fp + tn + 1e-9), 4),
+        "pr_auc": round(float(average_precision_score(labels, probs)), 4) if has_both else None,
+    }
+
+
+def predict_probs(model, loader, device, use_amp: bool):
     import torch
-    import torch.nn as nn
-    from transformers import DistilBertModel
-
-    class PhishingClassifier(nn.Module):
-        def __init__(self):
-            super().__init__()
-            # DistilBERT encoder — outputs 768-dim hidden states
-            self.distilbert = DistilBertModel.from_pretrained("distilbert-base-uncased")
-
-            # Project 10 header features to 32 dims to match scale of CLS embedding
-            self.header_projection = nn.Linear(10, 32)
-
-            # Classifier: 768 (CLS) + 32 (header) = 800 input dims
-            self.classifier = nn.Sequential(
-                nn.Linear(768 + 32, 256),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(256, 2),   # 2 output classes: LEGITIMATE (0), PHISHING (1)
-            )
-
-        def forward(self, input_ids, attention_mask, header_features):
-            # Extract [CLS] token representation from DistilBERT
-            db_output  = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
-            cls_output = db_output.last_hidden_state[:, 0, :]   # shape: (batch, 768)
-
-            # Project header auth signals
-            header_proj = torch.relu(self.header_projection(header_features))  # shape: (batch, 32)
-
-            # Fuse and classify
-            combined = torch.cat([cls_output, header_proj], dim=1)  # shape: (batch, 800)
-            return self.classifier(combined)                          # shape: (batch, 2)
-
-    return PhishingClassifier()
-
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-def load_and_prepare_data(csv_path: Path, tokenizer):
-    """
-    Load unified.csv, tokenize body_text, extract header features.
-    Returns train and val datasets.
-    """
-    log.info(f"Loading data from {csv_path}")
-    df = pd.read_csv(csv_path, dtype=str)
-
-    # Filter to train + val splits
-    df = df[df["split"].isin(["train", "val"])].reset_index(drop=True)
-    df["label"] = df["label"].astype(int)
-    log.info(f"Records: {len(df):,} | Label dist: {df['label'].value_counts().to_dict()}")
-
-    # Fill missing header feature columns with 0
-    for col in HEADER_FEATURE_NAMES:
-        if col not in df.columns:
-            df[col] = 0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
-
-    # Tokenize body_text
-    log.info(f"Tokenizing body_text (max_length={MAX_LENGTH})...")
-    body_texts = df["body_text"].fillna("").tolist()
-    encodings  = tokenizer(
-        body_texts,
-        max_length=MAX_LENGTH,
-        truncation=True,
-        padding="max_length",
-        return_tensors=None,   # return as lists (we convert to tensors in Dataset)
-    )
-
-    header_feats = df[HEADER_FEATURE_NAMES].values.tolist()
-    labels       = df["label"].tolist()
-    splits       = df["split"].tolist()
-
-    # Split into train and val
-    train_idx = [i for i, s in enumerate(splits) if s == "train"]
-    val_idx   = [i for i, s in enumerate(splits) if s == "val"]
-
-    def make_dataset(idx_list):
-        return PhishingEmailDataset(
-            input_ids       = [encodings["input_ids"][i]      for i in idx_list],
-            attention_masks = [encodings["attention_mask"][i]  for i in idx_list],
-            header_features = [header_feats[i]                 for i in idx_list],
-            labels          = [labels[i]                       for i in idx_list],
-        )
-
-    train_ds = make_dataset(train_idx)
-    val_ds   = make_dataset(val_idx)
-    log.info(f"Train: {len(train_ds):,} | Val: {len(val_ds):,}")
-
-    # Class distribution in train
-    train_labels = [labels[i] for i in train_idx]
-    n_legit      = train_labels.count(0)
-    n_phish      = train_labels.count(1)
-    log.info(f"Train class dist — Legitimate: {n_legit:,} | Phishing: {n_phish:,}")
-
-    return train_ds, val_ds, train_labels
-
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-def evaluate(model, loader, device, desc="Eval"):
-    """Evaluate model on a DataLoader. Returns metrics dict."""
-    import torch
-    from sklearn.metrics import (accuracy_score, precision_score,
-                                  recall_score, f1_score, average_precision_score)
-
     model.eval()
-    all_preds, all_labels, all_probs = [], [], []
-
+    probs_all, labels_all = [], []
     with torch.no_grad():
         for batch in loader:
-            input_ids       = batch["input_ids"].to(device)
-            attention_mask  = batch["attention_mask"].to(device)
-            header_features = batch["header_features"].to(device)
-            labels          = batch["labels"]
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                logits = model(batch["input_ids"].to(device),
+                               batch["attention_mask"].to(device),
+                               batch["header_features"].to(device))
+            probs_all.append(torch.softmax(logits.float(), dim=1)[:, 1].cpu().numpy())
+            labels_all.append(batch["labels"].numpy())
+    return np.concatenate(probs_all), np.concatenate(labels_all)
 
-            logits = model(input_ids, attention_mask, header_features)
-            probs  = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            preds  = logits.argmax(dim=1).cpu().numpy()
 
-            all_preds.extend(preds.tolist())
-            all_labels.extend(labels.numpy().tolist())
-            all_probs.extend(probs.tolist())
-
-    all_preds  = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    all_probs  = np.array(all_probs)
-
-    fp = np.sum((all_preds == 1) & (all_labels == 0))
-    tn = np.sum((all_preds == 0) & (all_labels == 0))
-    fpr = fp / (fp + tn + 1e-9)
-
-    return {
-        "accuracy":  round(accuracy_score(all_labels, all_preds), 4),
-        "precision": round(precision_score(all_labels, all_preds, zero_division=0), 4),
-        "recall":    round(recall_score(all_labels, all_preds, zero_division=0), 4),
-        "f1":        round(f1_score(all_labels, all_preds, zero_division=0), 4),
-        "fpr":       round(float(fpr), 4),
-        "pr_auc":    round(average_precision_score(all_labels, all_probs), 4),
-    }
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Training
 # ---------------------------------------------------------------------------
-def train(data_csv: Path = DATA_CSV):
+def build_model():
+    from ml.distilbert_model import PhishingClassifier
+    return PhishingClassifier(PRETRAINED)
+
+
+def train(args):
     import torch
     import torch.nn as nn
-    from torch.utils.data import DataLoader
-    from transformers import AutoTokenizer, get_linear_schedule_with_warmup
     from sklearn.utils.class_weight import compute_class_weight
-    from tqdm import tqdm
+    from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Device: {device}")
+    set_seed(args.seed)
+    device = pick_device()
+    use_amp = bool(args.fp16 and device.type == "cuda")
+    log.info(f"Device: {device} | fp16: {use_amp} | seed: {args.seed}")
 
-    # --- Tokenizer ---
-    log.info("Loading DistilBERT tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+    tokenizer = AutoTokenizer.from_pretrained(PRETRAINED)
 
     # --- Data ---
-    train_ds, val_ds, train_labels = load_and_prepare_data(data_csv, tokenizer)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+    frames = {}
+    for name, splits in {"train": ["train"], "val": ["val"],
+                         "test_std": ["test_std"], "test_cross": ["test_cross"]}.items():
+        frames[name], hdr = load_split_frame(Path(args.data), splits)
+        frames[name + "_hdr"] = hdr
+    tr, va = frames["train"], frames["val"]
+    class_balance_report(tr["label"].values, "train")
+    class_balance_report(va["label"].values, "val")
 
-    # --- Model ---
-    log.info("Building PhishingClassifier (DistilBERT + header fusion)...")
+    def encoded_for(name):
+        f = frames[name]
+        return EncodedEmails(encode(f["text"].tolist(), tokenizer, args.max_length),
+                             frames[name + "_hdr"], f["label"].values)
+
+    train_enc = encoded_for("train")
+    val_enc = encoded_for("val")
+    train_loader = make_loader(train_enc, tokenizer, args.batch_size, shuffle=True)
+    val_loader = make_loader(val_enc, tokenizer, args.batch_size * 2, shuffle=False)
+
+    # --- Model / loss / optimiser ---
     model = build_model().to(device)
+    class_weights = compute_class_weight("balanced", classes=np.array([0, 1]), y=tr["label"].values)
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32).to(device))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
+    total_steps = len(train_loader) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=int(WARMUP_RATIO * total_steps), num_training_steps=total_steps)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # --- Class weights (handles imbalance without SMOTE) ---
-    class_weights = compute_class_weight("balanced", classes=np.array([0, 1]), y=train_labels)
-    weight_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
-    criterion     = nn.CrossEntropyLoss(weight=weight_tensor)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    best_f1, best_epoch = -1.0, 0   # -1 so epoch 1 always saves a checkpoint
+    log.info(f"Epochs={args.epochs} | BatchSize={args.batch_size} | LR={args.lr} | MaxLen={args.max_length}")
 
-    # --- Optimizer + Scheduler ---
-    total_steps = len(train_loader) * EPOCHS
-    optimizer   = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
-    scheduler   = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps
-    )
-
-    # --- Training loop ---
-    best_f1        = 0.0
-    best_model_path = MODELS_DIR / "distilbert_tier1.pt"
-
-    log.info("=" * 60)
-    log.info("Starting training...")
-    log.info(f"Epochs={EPOCHS} | BatchSize={BATCH_SIZE} | LR={LEARNING_RATE}")
-    log.info("=" * 60)
-
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        total_loss   = 0.0
-        batch_count  = 0
-
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}", ncols=90)
-        for batch in pbar:
-            input_ids       = batch["input_ids"].to(device)
-            attention_mask  = batch["attention_mask"].to(device)
-            header_features = batch["header_features"].to(device)
-            labels          = batch["labels"].to(device)
-
+        total_loss, n_batches = 0.0, 0
+        for batch in train_loader:
             optimizer.zero_grad()
-            logits = model(input_ids, attention_mask, header_features)
-            loss   = criterion(logits, labels)
-            loss.backward()
-
-            # Gradient clipping prevents exploding gradients during fine-tuning
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                logits = model(batch["input_ids"].to(device),
+                               batch["attention_mask"].to(device),
+                               batch["header_features"].to(device))
+                loss = criterion(logits.float(), batch["labels"].to(device))
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
+            total_loss += loss.item()
+            n_batches += 1
 
-            total_loss  += loss.item()
-            batch_count += 1
-            pbar.set_postfix({"loss": f"{total_loss / batch_count:.4f}"})
+        probs, labels = predict_probs(model, val_loader, device, use_amp)
+        m = classification_metrics(labels, probs)
+        log.info(f"Epoch {epoch}/{args.epochs} | loss={total_loss / max(n_batches, 1):.4f} | "
+                 f"val F1={m['f1']} P={m['precision']} R={m['recall']} FPR={m['fpr']} PR-AUC={m['pr_auc']}")
 
-        avg_loss = total_loss / max(batch_count, 1)
+        if m["f1"] > best_f1:
+            best_f1, best_epoch = m["f1"], epoch
+            torch.save(model.state_dict(), WEIGHTS_PATH)
+            log.info(f"  New best checkpoint saved (val F1={best_f1:.4f})")
 
-        # Evaluate on val set after each epoch
-        metrics = evaluate(model, val_loader, device, desc=f"Val Epoch {epoch}")
-        log.info(
-            f"\nEpoch {epoch}/{EPOCHS} | AvgLoss={avg_loss:.4f} | "
-            f"Acc={metrics['accuracy']} | P={metrics['precision']} | "
-            f"R={metrics['recall']} | F1={metrics['f1']} | "
-            f"FPR={metrics['fpr']} | PR-AUC={metrics['pr_auc']}"
-        )
+    # --- Reload best checkpoint (weights_only: no pickle code execution) ---
+    model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device, weights_only=True))
+    val_probs, val_labels = predict_probs(model, val_loader, device, use_amp)
+    val_metrics = classification_metrics(val_labels, val_probs)
 
-        # Best model checkpointing (save on val F1 improvement)
-        if metrics["f1"] > best_f1:
-            best_f1 = metrics["f1"]
-            torch.save(model.state_dict(), best_model_path)
-            log.info(f"  New best model saved (F1={best_f1:.4f})")
+    # --- Held-out test metrics (URL-only rows excluded) ---
+    test_metrics = {}
+    for name in ("test_std", "test_cross"):
+        f = frames[name]
+        keep = ~f["url_only"].values
+        if keep.sum() == 0:
+            log.warning(f"{name}: no email rows to evaluate.")
+            continue
+        enc = EncodedEmails(
+            encode([t for t, k in zip(f["text"], keep) if k], tokenizer, args.max_length),
+            frames[name + "_hdr"][keep], f["label"].values[keep])
+        loader = make_loader(enc, tokenizer, args.batch_size * 2, shuffle=False)
+        p, y = predict_probs(model, loader, device, use_amp)
+        test_metrics[name] = classification_metrics(y, p)
+        class_balance_report(y, name)
+        log.info(f"{name}: {test_metrics[name]}")
 
-    log.info(f"\nTraining complete. Best val F1 = {best_f1:.4f}")
+    # --- Save tokenizer and config ---
+    tokenizer.save_pretrained(str(TOKENIZER_DIR))
+    weights_sha = sha256_of(WEIGHTS_PATH)
 
-    # --- Final evaluation on val set ---
-    log.info("\nFinal evaluation on validation set:")
-    from sklearn.metrics import classification_report
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
-    # Load best checkpoint
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
-    final_metrics = evaluate(model, val_loader, device)
-
-    log.info(f"Phishing Recall : {final_metrics['recall']}")
-    log.info(f"FPR             : {final_metrics['fpr']}")
-    log.info(f"PR-AUC          : {final_metrics['pr_auc']}")
-    log.info(f"F1              : {final_metrics['f1']}")
-
-    # Confusion matrix plot
-    model.eval()
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for batch in val_loader:
-            logits = model(
-                batch["input_ids"].to(device),
-                batch["attention_mask"].to(device),
-                batch["header_features"].to(device),
-            )
-            all_preds.extend(logits.argmax(dim=1).cpu().numpy().tolist())
-            all_labels.extend(batch["labels"].numpy().tolist())
-
-    from sklearn.metrics import confusion_matrix as sk_cm
-    cm = sk_cm(all_labels, all_preds, labels=[0, 1])
-    plt.figure(figsize=(7, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=["LEGITIMATE", "PHISHING"],
-                yticklabels=["LEGITIMATE", "PHISHING"])
-    plt.title("NETRA DistilBERT — Confusion Matrix (Val Set)")
-    plt.ylabel("True Label")
-    plt.xlabel("Predicted Label")
-    plt.tight_layout()
-    cm_path = EVAL_DIR / "confusion_matrix_distilbert.png"
-    plt.savefig(cm_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    log.info(f"Confusion matrix saved: {cm_path}")
-
-    # --- Save tokenizer ---
-    tokenizer_dir = MODELS_DIR / "distilbert_tokenizer"
-    tokenizer.save_pretrained(str(tokenizer_dir))
-    log.info(f"Tokenizer saved: {tokenizer_dir}")
-
-    # --- Save inference config ---
-    config = {
-        "model":                "distilbert-base-uncased",
-        "max_length":           MAX_LENGTH,
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
+    config.update({
+        "model": PRETRAINED,
+        "max_length": args.max_length,
         "confidence_threshold": CONFIDENCE_THRESHOLD,
-        "header_features":      HEADER_FEATURE_NAMES,
-        "best_val_f1":          best_f1,
-        "best_val_recall":      final_metrics["recall"],
-        "best_val_fpr":         final_metrics["fpr"],
-    }
-    config_path = MODELS_DIR / "distilbert_config.json"
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-    log.info(f"Config saved: {config_path}")
+        "header_features": HEADER_FEATURE_NAMES,
+        "header_features_trained": True,
+        "text_format": TEXT_FORMAT,
+        "best_epoch": best_epoch,
+        "best_val_f1": val_metrics["f1"],
+        "best_val_recall": val_metrics["recall"],
+        "best_val_fpr": val_metrics["fpr"],
+        "val_metrics": val_metrics,
+        "test_metrics": test_metrics,
+        "weights_sha256": weights_sha,
+        "training": {
+            "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
+            "max_length": args.max_length, "fp16": use_amp, "seed": args.seed,
+            "data": str(args.data), "trained_at": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    log.info("\n" + "=" * 60)
-    log.info("DONE. Download these 3 items from Colab to ml/models/:")
-    log.info("  1. distilbert_tier1.pt         (~250MB model weights)")
-    log.info("  2. distilbert_tokenizer/        (tokenizer folder)")
-    log.info("  3. distilbert_config.json       (inference config)")
     log.info("=" * 60)
-
+    log.info(f"Done. Best epoch {best_epoch}, val F1 {best_f1:.4f}")
+    log.info(f"Weights   : {WEIGHTS_PATH} (sha256 {weights_sha[:12]}...)")
+    log.info(f"Config    : {CONFIG_PATH}")
+    log.info("Next: python ml/calibrate_threshold.py  (sets thresholds from val probabilities)")
+    log.info("=" * 60)
     return model, tokenizer, config
 
 
@@ -431,7 +380,11 @@ def train(data_csv: Path = DATA_CSV):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NETRA DistilBERT Training")
-    parser.add_argument("--data", type=str, default=str(DATA_CSV),
-                        help="Path to unified.csv")
-    args = parser.parse_args()
-    train(data_csv=Path(args.data))
+    parser.add_argument("--data", type=str, default=str(DATA_CSV), help="Path to unified.csv")
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--max_length", type=int, default=MAX_LENGTH)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--fp16", action="store_true", help="Mixed precision (CUDA only)")
+    train(parser.parse_args())

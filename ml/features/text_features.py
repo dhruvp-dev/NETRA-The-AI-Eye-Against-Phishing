@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import hstack, csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +121,29 @@ class TextFeatureExtractor:
         body = df["body_text"].fillna("")
         return (subject + " " + body).str.strip()
 
+    @staticmethod
+    def _log_scale(hc: np.ndarray) -> np.ndarray:
+        """log1p on the unbounded count/length columns (length, exclamations)."""
+        out = hc.astype(np.float64).copy()
+        for col in (1, 2):          # hc_text_length, hc_exclamation_count
+            out[:, col] = np.log1p(out[:, col])
+        return out
+
+    def _scale_handcrafted(self, hc: np.ndarray, fit: bool) -> np.ndarray:
+        """
+        Put handcrafted columns on the same scale as TF-IDF (ML13). The scaler is
+        fit on training data only. Extractors pickled before this change have no
+        `_hc_scaler` attribute and fall through unscaled, so the shipped RF keeps working.
+        """
+        if fit:
+            scaled_input = self._log_scale(hc)
+            self._hc_scaler = StandardScaler().fit(scaled_input)
+            return self._hc_scaler.transform(scaled_input)
+        scaler = getattr(self, "_hc_scaler", None)
+        if scaler is None:          # legacy pickle: keep the exact old behaviour
+            return hc
+        return scaler.transform(self._log_scale(hc))
+
     def fit_transform(self, df: pd.DataFrame) -> csr_matrix:
         """
         Fit on training data and transform.
@@ -133,7 +157,7 @@ class TextFeatureExtractor:
         self._fitted = True
         log.info(f"TF-IDF fitted: vocab size = {len(self.tfidf.vocabulary_)}")
 
-        handcrafted = csr_matrix(extract_handcrafted(df))
+        handcrafted = csr_matrix(self._scale_handcrafted(extract_handcrafted(df), fit=True))
         return hstack([tfidf_matrix, handcrafted])
 
     def transform(self, df: pd.DataFrame) -> csr_matrix:
@@ -145,7 +169,7 @@ class TextFeatureExtractor:
             raise RuntimeError("TextFeatureExtractor must be fit first via fit_transform().")
         text_corpus = self._get_text(df)
         tfidf_matrix = self.tfidf.transform(text_corpus)
-        handcrafted = csr_matrix(extract_handcrafted(df))
+        handcrafted = csr_matrix(self._scale_handcrafted(extract_handcrafted(df), fit=False))
         return hstack([tfidf_matrix, handcrafted])
 
     @property

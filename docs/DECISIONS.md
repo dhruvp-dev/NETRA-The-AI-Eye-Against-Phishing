@@ -101,19 +101,17 @@ Use **Integrated Gradients** (via Meta's captum library) for token-level attribu
 
 ---
 
-## Decision 6: Combined System Performance
+## Decision 6: Drop Tier-2 (RoBERTa escalation)
 
-**Date:** TBD
-**Status:** Pending Evaluation
+**Status:** Accepted. Supersedes Decisions 1-5.
 
-| Metric | Tier-1 Only | Tier-1 + Tier-2 |
-|---|---|---|
-| Phishing Recall | 99.92% | TBD |
-| FPR | TBD | TBD |
-| F1 | 99.93% | TBD |
-| Escalation Rate | N/A | TBD |
-| Avg Latency (non-escalated) | ~180ms | ~180ms |
-| Avg Latency (escalated) | N/A | TBD |
+**Reason:** The shipped Tier-2 model was degenerate. Phishing recall was 2/17 on
+its test split, and SUSPICIOUS recall was 0/5. Its training labels were also
+derived from Tier-1 outputs (label leakage, see the ML bug report). Keeping it
+would have overridden Tier-1 verdicts with a weaker model.
 
-> If Tier-2 does not improve recall meaningfully, that result will be
-> documented honestly. A null result is a valid research finding.
+**Decision:** Tier-2 and its service, client, notebook and configs are removed.
+The system is Tier-1 only. If escalation is reconsidered, it should start from
+a clean label source that does not depend on Tier-1 outputs.
+
+> Decisions 1-5 are kept for history only. Their Tier-2 design no longer applies.

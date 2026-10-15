@@ -184,7 +184,7 @@ def evaluate_model(
     if hasattr(model, "predict_proba"):
         y_prob = model.predict_proba(X_val)[:, 1]
     else:
-        # CalibratedClassifierCV wraps LinearSVC â€” will always have predict_proba
+        # CalibratedClassifierCV wraps LinearSVC - will always have predict_proba
         y_prob = np.zeros(len(y_val))
 
     acc = accuracy_score(y_val, y_pred)
@@ -209,7 +209,7 @@ def evaluate_model(
         f"  Model  : {model_name}\n"
         f"  Acc    : {acc:.4f}\n"
         f"  Prec   : {prec:.4f}\n"
-        f"  Recall : {rec:.4f}   â† phishing recall\n"
+        f"  Recall : {rec:.4f}   <- phishing recall\n"
         f"  F1     : {f1:.4f}\n"
         f"  FPR    : {fpr:.4f}\n"
         f"  PR-AUC : {pr_auc:.4f}\n"
@@ -222,10 +222,13 @@ def evaluate_model(
 # Model definitions
 # ---------------------------------------------------------------------------
 
-def build_models() -> list:
+def build_models(class_weight="balanced") -> list:
     """
     Return list of (name, estimator) tuples.
     LinearSVC is wrapped in CalibratedClassifierCV for probability estimates.
+
+    class_weight should be None when SMOTE has already balanced the training
+    data. Using both corrects the same imbalance twice (ML13).
     """
     models = [
         (
@@ -233,7 +236,7 @@ def build_models() -> list:
             LogisticRegression(
                 C=1.0,
                 max_iter=1000,
-                class_weight="balanced",
+                class_weight=class_weight,
                 solver="saga",
                 n_jobs=-1,
             ),
@@ -241,7 +244,7 @@ def build_models() -> list:
         (
             "Linear SVM (calibrated)",
             CalibratedClassifierCV(
-                LinearSVC(C=1.0, class_weight="balanced", max_iter=2000),
+                LinearSVC(C=1.0, class_weight=class_weight, max_iter=2000),
                 cv=3,
             ),
         ),
@@ -249,7 +252,7 @@ def build_models() -> list:
             "Random Forest",
             RandomForestClassifier(
                 n_estimators=500,
-                class_weight="balanced",
+                class_weight=class_weight,
                 n_jobs=-1,
                 random_state=42,
                 max_depth=None,
@@ -321,22 +324,26 @@ def train(data_csv: Path = DATA_CSV):
 
 
     # ---------------------------------------------------------------------------
-    # SMOTE Oversampling (train split only — val/test untouched)
+    # SMOTE Oversampling (train split only - val/test untouched)
     # ---------------------------------------------------------------------------
     log.info("Applying SMOTE to training data (sampling_strategy=0.3)...")
     log.info(f"Class distribution BEFORE SMOTE: {dict(zip(*np.unique(y_train, return_counts=True)))}")
 
+    smote_applied = False
     try:
         smote = SMOTE(sampling_strategy=0.3, random_state=42, n_jobs=-1)
         X_train, y_train = smote.fit_resample(X_train, y_train)
+        smote_applied = True
         log.info(f"Class distribution AFTER  SMOTE: {dict(zip(*np.unique(y_train, return_counts=True)))}")
         log.info(f"Training set size after SMOTE: {X_train.shape[0]:,} samples")
-    except Exception as e:
-        log.warning(f"SMOTE failed ({e}) — training on original imbalanced data")
+    except ValueError as e:
+        # Usually sampling_strategy is below the current minority ratio.
+        log.warning(f"SMOTE skipped ({e}); training on original data with class_weight=balanced")
 
     # --- Train all candidate models ---
+    # One imbalance correction only: SMOTE OR class weights, never both (ML13).
     results = []
-    for name, estimator in build_models():
+    for name, estimator in build_models(class_weight=None if smote_applied else "balanced"):
         log.info(f"\nTraining: {name}")
         estimator.fit(X_train, y_train)
         metrics = evaluate_model(estimator, X_val, y_val, name)
@@ -347,21 +354,21 @@ def train(data_csv: Path = DATA_CSV):
 
     # Check target thresholds
     if best["metrics"]["recall"] >= 0.90:
-        log.info("âœ“ Phishing Recall target (â‰¥0.90) ACHIEVED")
+        log.info("OK Phishing Recall target (>=0.90) ACHIEVED")
     else:
-        log.warning(f"âœ— Phishing Recall target NOT achieved ({best['metrics']['recall']:.4f} < 0.90)")
+        log.warning(f"FAIL Phishing Recall target NOT achieved ({best['metrics']['recall']:.4f} < 0.90)")
 
     if best["metrics"]["fpr"] <= 0.05:
-        log.info("âœ“ FPR target (â‰¤0.05) ACHIEVED")
+        log.info("OK FPR target (<=0.05) ACHIEVED")
     else:
-        log.warning(f"âœ— FPR target NOT achieved ({best['metrics']['fpr']:.4f} > 0.05)")
+        log.warning(f"FAIL FPR target NOT achieved ({best['metrics']['fpr']:.4f} > 0.05)")
 
     # --- Save artefacts ---
     joblib.dump(best["model"], MODEL_PATH)
-    log.info(f"Saved model â†’ {MODEL_PATH}")
+    log.info(f"Saved model -> {MODEL_PATH}")
 
     joblib.dump(text_extractor, TFIDF_PATH)
-    log.info(f"Saved TF-IDF extractor â†’ {TFIDF_PATH}")
+    log.info(f"Saved TF-IDF extractor -> {TFIDF_PATH}")
 
     # --- Save metrics summary ---
     metrics_path = MODELS_DIR / "training_metrics.json"
@@ -372,7 +379,7 @@ def train(data_csv: Path = DATA_CSV):
     }
     with open(metrics_path, "w") as f:
         json.dump(all_metrics_with_best, f, indent=2)
-    log.info(f"Saved metrics â†’ {metrics_path}")
+    log.info(f"Saved metrics -> {metrics_path}")
 
     log.info("\nTraining complete.")
     return best["model"], text_extractor, results
