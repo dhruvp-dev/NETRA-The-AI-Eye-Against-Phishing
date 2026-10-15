@@ -2,6 +2,9 @@
   "model": "distilbert-base-uncased",
   "max_length": 256,
   "confidence_threshold": 0.7,
+  "weights_sha256": "b5df43f2ed5b747a6c16ea190415e9d79c53a750efa68c92a44497429333b3c0",
+  "header_features_trained": false,
+  "text_format": "body_only",
   "header_features": [
     "spf_pass",
     "spf_fail",
@@ -12,7 +15,7 @@
     "dmarc_pass",
     "dmarc_fail",
     "dmarc_none",
-    "sender_domain_match"
+    "sender_domain_matches_reply_to"
   ],
   "best_val_f1": 0.9993,
   "best_val_recall": 0.9992,

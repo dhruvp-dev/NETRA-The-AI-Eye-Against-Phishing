@@ -1,0 +1,1 @@
+{"phishing_threshold":0.2500,"suspicious_lower":0.0800,"suspicious_upper":0.2500,"method":"manual_empirical_v2","val_f1":null,"val_recall":null,"val_precision":null,"val_fpr":null,"recall_90_threshold":null}
