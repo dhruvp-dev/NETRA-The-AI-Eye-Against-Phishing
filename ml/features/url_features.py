@@ -19,7 +19,12 @@ import logging
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Tuple
 
+import tldextract
+
 log = logging.getLogger(__name__)
+
+# Bundled public-suffix snapshot only: no network fetch at request time.
+_TLD = tldextract.TLDExtract(suffix_list_urls=())
 
 PHISHING_TLDS = {".tk", ".ml", ".ga", ".cf", ".gq", ".pw", ".top", ".xyz", ".buzz", ".click", ".info"}
 
@@ -28,6 +33,34 @@ BRAND_DOMAINS = [
     "instagram", "twitter", "linkedin", "dropbox", "github", "chase", "wellsfargo",
     "bankofamerica", "dhl", "fedex", "ups", "steam", "discord",
 ]
+
+# Registrable domains that legitimately belong to each brand.
+BRAND_REAL_DOMAINS = {
+    "paypal": {"paypal.com"},
+    "microsoft": {"microsoft.com", "live.com", "outlook.com", "office.com", "office365.com", "microsoftonline.com"},
+    "apple": {"apple.com", "icloud.com"},
+    "google": {"google.com", "gmail.com", "googleapis.com", "googleusercontent.com"},
+    "amazon": {"amazon.com"},
+    "netflix": {"netflix.com"},
+    "facebook": {"facebook.com", "fb.com"},
+    "instagram": {"instagram.com"},
+    "twitter": {"twitter.com", "x.com"},
+    "linkedin": {"linkedin.com"},
+    "dropbox": {"dropbox.com"},
+    "github": {"github.com", "githubusercontent.com"},
+    "chase": {"chase.com"},
+    "wellsfargo": {"wellsfargo.com"},
+    "bankofamerica": {"bankofamerica.com"},
+    "dhl": {"dhl.com", "dhl.de"},
+    "fedex": {"fedex.com"},
+    "ups": {"ups.com"},
+    "steam": {"steampowered.com", "steamcommunity.com", "steamstatic.com"},
+    "discord": {"discord.com", "discordapp.com"},
+}
+
+# Known-benign registrable domains that the fuzzy matcher would otherwise flag
+# (e.g. stream.com is 0.2 from "steam").
+TYPO_ALLOWLIST = {"stream.com", "upstream.com"}
 
 _IP_PATTERN = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
 
@@ -48,44 +81,61 @@ def _levenshtein(s1: str, s2: str) -> int:
     return dp[n]
 
 
+def _split_host(hostname: str):
+    """Return (tldextract result, registrable domain such as 'paypal.com')."""
+    ext = _TLD(hostname)
+    registrable = f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
+    return ext, registrable
+
+
 def check_typosquatting(domain: str) -> Tuple[int, float]:
     """
-    Check if a domain is a typosquatted version of a high-value brand.
+    Check whether a hostname imitates a high-value brand.
     Returns (flag: int, min_normalized_distance: float).
-    A normalized distance < 0.25 is flagged as likely typosquatting.
+
+    Rules (ML6 / ML20):
+      * A host whose registrable domain is a real brand domain (paypal.com,
+        mail.google.com) is never flagged.
+      * Any brand token that appears as an exact label or hyphen piece of a
+        NON-brand registrable domain is flagged: paypal.evil.com,
+        secure-paypal-login.com, apple.com.evil.ru.
+      * Otherwise a fuzzy match (0 < normalised distance < 0.25) is flagged,
+        e.g. paypa1-secure.tk.
     """
-    if not domain:
+    host = (domain or "").lower().strip(".")
+    if not host:
         return 0, 1.0
 
-    parts      = domain.lower().split(".")
-    candidates = []
-    if len(parts) >= 2: candidates.append(parts[-2])
-    if len(parts) >= 3: candidates.append(parts[-3])
-    candidates.append(parts[0])
+    ext, registrable = _split_host(host)
+    if registrable in TYPO_ALLOWLIST:
+        return 0, 0.0
+    if ext.domain in BRAND_REAL_DOMAINS and registrable in BRAND_REAL_DOMAINS[ext.domain]:
+        return 0, 0.0
 
-    expanded = list(candidates)
-    for c in candidates:
-        stripped = c.replace("-", "").replace("_", "")
-        if stripped not in expanded:
-            expanded.append(stripped)
-        for sub in re.split(r"[-_]", c):
-            if sub and sub not in expanded:
-                expanded.append(sub)
-
-    min_dist = 1.0
-    for candidate in expanded:
-        if not candidate:
+    # Brand candidates: registrable label, subdomain labels, and their hyphen/underscore pieces.
+    tokens = set()
+    for label in [ext.domain] + ext.subdomain.split("."):
+        if not label:
             continue
-        for brand in BRAND_DOMAINS:
-            if abs(len(candidate) - len(brand)) > 4:
-                continue
-            dist = _levenshtein(candidate, brand)
-            norm = dist / max(len(brand), 1)
-            if norm < min_dist:
-                min_dist = norm
+        tokens.add(label)
+        tokens.add(label.replace("-", "").replace("_", ""))
+        tokens.update(t for t in re.split(r"[-_]", label) if t)
+    tokens.discard("")
 
-    # A distance of 0.0 is an exact legitimate brand domain, NOT typosquatting
-    flag = 1 if 0.0 < min_dist < 0.25 else 0
+    exact = any(tok == brand for tok in tokens for brand in BRAND_DOMAINS)
+
+    min_dist = 0.0 if exact else 1.0
+    if not exact:
+        for candidate in tokens:
+            for brand in BRAND_DOMAINS:
+                if abs(len(candidate) - len(brand)) > 4:
+                    continue
+                norm = _levenshtein(candidate, brand) / max(len(brand), 1)
+                if norm < min_dist:
+                    min_dist = norm
+
+    fuzzy = 0.0 < min_dist < 0.25
+    flag = 1 if (exact or fuzzy) else 0
     return flag, round(min_dist, 4)
 
 
@@ -94,10 +144,11 @@ def _is_ip_address(hostname: str) -> bool:
 
 
 def _subdomain_depth(hostname: str) -> int:
+    """Number of labels left of the registrable domain (public-suffix aware, ML20)."""
     if not hostname:
         return 0
-    parts = hostname.split(".")
-    return max(0, len(parts) - 2)
+    ext = _TLD(hostname.lower())
+    return len(ext.subdomain.split(".")) if ext.subdomain else 0
 
 
 def _has_phishing_tld(hostname: str) -> bool:

@@ -9,8 +9,10 @@ Usage:
     features = extract(headers_dict, sender="foo@bar.com", reply_to="other@domain.com")
 """
 
+import json
 import re
 import logging
+from email.utils import parseaddr
 from typing import Dict, Any, Optional
 
 log = logging.getLogger(__name__)
@@ -21,15 +23,30 @@ log = logging.getLogger(__name__)
 
 _AUTH_STATES = ["pass", "fail", "none"]
 
+# One normaliser for every auth-result spelling (ML14). softfail counts as fail
+# everywhere (training parsers and inference). neutral/temperror/permerror carry
+# no usable pass/fail signal, so they map to none.
+_AUTH_ALIASES = {
+    "softfail": "fail",
+    "neutral": "none",
+    "temperror": "none",
+    "permerror": "none",
+}
+
+
+def normalize_auth(value) -> str:
+    """Map any SPF/DKIM/DMARC result string to 'pass' | 'fail' | 'none'."""
+    v = str(value or "none").lower().strip()
+    v = _AUTH_ALIASES.get(v, v)
+    return v if v in _AUTH_STATES else "none"
+
 
 def _one_hot_auth(value: str) -> Dict[str, int]:
     """
     Convert an auth value ('pass'|'fail'|'none'|other) to 3-dim one-hot dict.
     Unknown values map to 'none'.
     """
-    value = (value or "none").lower().strip()
-    if value not in _AUTH_STATES:
-        value = "none"
+    value = normalize_auth(value)
     return {state: int(value == state) for state in _AUTH_STATES}
 
 
@@ -41,12 +58,20 @@ _EMAIL_DOMAIN_RE = re.compile(r"@([\w.\-]+)")
 
 
 def _extract_domain(address) -> Optional[str]:
-    """Extract the domain part from an email address string."""
+    """
+    Extract the domain part from an address. Handles 'Name <a@b.com>' via
+    email.utils.parseaddr so display names containing '@' or '>' cannot
+    confuse the domain (A20).
+    """
     if address is None:
         return None
     address_str = str(address).strip()
     if not address_str or address_str.lower() == "nan":
         return None
+    _, addr = parseaddr(address_str)
+    if "@" in addr:
+        domain = addr.rsplit("@", 1)[1].strip().strip(">").lower()
+        return domain or None
     match = _EMAIL_DOMAIN_RE.search(address_str)
     return match.group(1).lower() if match else None
 
@@ -126,3 +151,19 @@ def extract(
 HEADER_FEATURE_NAMES = list(
     extract({}, sender="a@x.com", reply_to="a@x.com").keys()
 )
+
+
+def extract_from_row(headers_json, sender="", reply_to="") -> Dict[str, int]:
+    """
+    Training helper: take the raw `headers_available` JSON string from a
+    unified.csv row (or an already-parsed dict) and return the 10 features.
+    Malformed JSON yields an all-'none' header block instead of raising.
+    """
+    if isinstance(headers_json, dict):
+        headers = headers_json
+    else:
+        try:
+            headers = json.loads(headers_json) if headers_json else {}
+        except (TypeError, ValueError):
+            headers = {}
+    return extract(headers, sender=str(sender or ""), reply_to=str(reply_to or ""))
