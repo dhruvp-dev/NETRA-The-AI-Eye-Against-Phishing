@@ -1,7 +1,7 @@
 {
   "model": "distilbert-base-uncased",
   "max_length": 256,
-  "weights_sha256": "653ebaf339448b45044e7e90cb25a034c89c37c46b43279c83966d2466059aaa",
+  "weights_sha256": "69862fc32926f608cb227c0694a9cf1165ef93e6dabbfd57e9495f2cf804ee08",
   "header_features_trained": true,
   "header_auth_learned": false,
   "text_format": "v3",
@@ -17,9 +17,9 @@
     "dmarc_none",
     "sender_domain_matches_reply_to"
   ],
-  "best_val_f1": 0.9919,
-  "best_val_recall": 0.9894,
-  "best_val_fpr": 0.0037,
+  "best_val_f1": 0.9898,
+  "best_val_recall": 0.9851,
+  "best_val_fpr": 0.0047,
   "training_history": [
     {
       "epoch": 1,
@@ -52,73 +52,62 @@
       "pr_auc": 1.0
     }
   ],
-  "best_epoch": 3,
+  "best_epoch": 2,
   "best_val_pr_auc": 0.9995,
   "val_metrics": {
-    "n": 8502,
-    "n_legitimate": 5092,
-    "n_malicious": 3410,
-    "accuracy": 0.9935,
-    "precision": 0.9944,
-    "recall": 0.9894,
-    "f1": 0.9919,
-    "fpr": 0.0037,
+    "n": 3984,
+    "n_legitimate": 2108,
+    "n_malicious": 1876,
+    "accuracy": 0.9905,
+    "precision": 0.9946,
+    "recall": 0.9851,
+    "f1": 0.9898,
+    "fpr": 0.0047,
     "pr_auc": 0.9995,
     "url_only_recall": 1.0
   },
   "test_metrics": {
     "test_std": {
-      "n": 8502,
-      "n_legitimate": 5092,
-      "n_malicious": 3410,
-      "accuracy": 0.9921,
-      "precision": 0.9938,
-      "recall": 0.9865,
-      "f1": 0.9901,
-      "fpr": 0.0041,
-      "pr_auc": 0.9992,
+      "n": 3984,
+      "n_legitimate": 2108,
+      "n_malicious": 1876,
+      "accuracy": 0.9902,
+      "precision": 0.9951,
+      "recall": 0.984,
+      "f1": 0.9895,
+      "fpr": 0.0043,
+      "pr_auc": 0.9995,
       "by_source": {
-        "ceas_08": {
-          "n": 3486,
-          "n_legitimate": 1802,
-          "n_malicious": 1684,
-          "accuracy": 0.9954,
-          "precision": 0.9964,
-          "recall": 0.9941,
-          "f1": 0.9952,
-          "fpr": 0.0033,
-          "pr_auc": 0.9998
-        },
         "enron": {
-          "n": 3006,
-          "n_legitimate": 3006,
+          "n": 1446,
+          "n_legitimate": 1446,
           "n_malicious": 0,
-          "accuracy": 0.996,
+          "accuracy": 0.9986,
           "precision": 0.0,
           "recall": 0.0,
           "f1": 0.0,
-          "fpr": 0.004,
+          "fpr": 0.0014,
           "pr_auc": null
+        },
+        "ling": {
+          "n": 1343,
+          "n_legitimate": 662,
+          "n_malicious": 681,
+          "accuracy": 0.9866,
+          "precision": 0.9897,
+          "recall": 0.9838,
+          "f1": 0.9867,
+          "fpr": 0.0106,
+          "pr_auc": 0.9988
         },
         "nazario": {
           "n": 184,
           "n_legitimate": 0,
           "n_malicious": 184,
-          "accuracy": 0.9783,
+          "accuracy": 0.9674,
           "precision": 1.0,
-          "recall": 0.9783,
-          "f1": 0.989,
-          "fpr": 0.0,
-          "pr_auc": null
-        },
-        "nigerian_fraud": {
-          "n": 345,
-          "n_legitimate": 0,
-          "n_malicious": 345,
-          "accuracy": 0.9884,
-          "precision": 1.0,
-          "recall": 0.9884,
-          "f1": 0.9942,
+          "recall": 0.9674,
+          "f1": 0.9834,
           "fpr": 0.0,
           "pr_auc": null
         },
@@ -126,56 +115,34 @@
           "n": 1011,
           "n_legitimate": 0,
           "n_malicious": 1011,
-          "accuracy": 0.9931,
+          "accuracy": 0.9871,
           "precision": 1.0,
-          "recall": 0.9931,
-          "f1": 0.9965,
+          "recall": 0.9871,
+          "f1": 0.9935,
           "fpr": 0.0,
           "pr_auc": null
-        },
-        "spamassassin": {
-          "n": 470,
-          "n_legitimate": 284,
-          "n_malicious": 186,
-          "accuracy": 0.9489,
-          "precision": 0.9821,
-          "recall": 0.8871,
-          "f1": 0.9322,
-          "fpr": 0.0106,
-          "pr_auc": 0.9932
         }
       },
       "by_label_origin": {
         "ham": {
-          "n": 5092,
-          "n_legitimate": 5092,
+          "n": 2108,
+          "n_legitimate": 2108,
           "n_malicious": 0,
-          "accuracy": 0.9959,
+          "accuracy": 0.9957,
           "precision": 0.0,
           "recall": 0.0,
           "f1": 0.0,
-          "fpr": 0.0041,
+          "fpr": 0.0043,
           "pr_auc": null
         },
         "phish": {
-          "n": 3224,
+          "n": 1876,
           "n_legitimate": 0,
-          "n_malicious": 3224,
-          "accuracy": 0.9922,
+          "n_malicious": 1876,
+          "accuracy": 0.984,
           "precision": 1.0,
-          "recall": 0.9922,
-          "f1": 0.9961,
-          "fpr": 0.0,
-          "pr_auc": null
-        },
-        "spam": {
-          "n": 186,
-          "n_legitimate": 0,
-          "n_malicious": 186,
-          "accuracy": 0.8871,
-          "precision": 1.0,
-          "recall": 0.8871,
-          "f1": 0.9402,
+          "recall": 0.984,
+          "f1": 0.9919,
           "fpr": 0.0,
           "pr_auc": null
         }
@@ -184,48 +151,48 @@
       "n_url_only": 31
     },
     "test_cross": {
-      "n": 2858,
-      "n_legitimate": 2400,
-      "n_malicious": 458,
-      "accuracy": 0.9521,
-      "precision": 0.9397,
-      "recall": 0.7489,
-      "f1": 0.8335,
-      "fpr": 0.0092,
-      "pr_auc": 0.9237,
+      "n": 4479,
+      "n_legitimate": 2706,
+      "n_malicious": 1773,
+      "accuracy": 0.9357,
+      "precision": 0.9888,
+      "recall": 0.8472,
+      "f1": 0.9125,
+      "fpr": 0.0063,
+      "pr_auc": 0.9895,
       "by_source": {
-        "ling": {
-          "n": 2858,
-          "n_legitimate": 2400,
-          "n_malicious": 458,
-          "accuracy": 0.9521,
-          "precision": 0.9397,
-          "recall": 0.7489,
-          "f1": 0.8335,
-          "fpr": 0.0092,
-          "pr_auc": 0.9237
+        "spamassassin": {
+          "n": 4479,
+          "n_legitimate": 2706,
+          "n_malicious": 1773,
+          "accuracy": 0.9357,
+          "precision": 0.9888,
+          "recall": 0.8472,
+          "f1": 0.9125,
+          "fpr": 0.0063,
+          "pr_auc": 0.9895
         }
       },
       "by_label_origin": {
         "ham": {
-          "n": 2400,
-          "n_legitimate": 2400,
+          "n": 2706,
+          "n_legitimate": 2706,
           "n_malicious": 0,
-          "accuracy": 0.9908,
+          "accuracy": 0.9937,
           "precision": 0.0,
           "recall": 0.0,
           "f1": 0.0,
-          "fpr": 0.0092,
+          "fpr": 0.0063,
           "pr_auc": null
         },
-        "phish": {
-          "n": 458,
+        "spam": {
+          "n": 1773,
           "n_legitimate": 0,
-          "n_malicious": 458,
-          "accuracy": 0.7489,
+          "n_malicious": 1773,
+          "accuracy": 0.8472,
           "precision": 1.0,
-          "recall": 0.7489,
-          "f1": 0.8564,
+          "recall": 0.8472,
+          "f1": 0.9173,
           "fpr": 0.0,
           "pr_auc": null
         }
@@ -245,14 +212,15 @@
     "seed": 42,
     "patience": 1,
     "max_train_rows": null,
-    "data": "data/processed/unified.csv",
+    "data": "/workspace/NETRA-The-AI-Eye-Against-Phishing/data/processed/unified.csv",
     "pipeline_version": "4",
-    "trained_at": "2026-10-16T10:39:50.696251+00:00"
+    "trained_at": "2026-10-16T20:25:15.356791+00:00"
   },
   "known_limitations": [
     "Audit 2026-10-17 (bugs/tier1_model_bugs.md): every legitimate training row is Enron and most phishing rows are URL-only, so the model scores brand / transactional mail with links as phishing. The reported F1 is for in-distribution benchmark splits only.",
     "Training data has no SPF/DKIM/DMARC results (all 'none'), so the header branch did not learn authentication. header_auth_learned=false: /explain does not report header attributions; auth is used by the rule layer only.",
     "Scores are saturated near 0 or 1 (not calibrated).",
     "Serving mitigations without retraining: windowed scoring of long emails, trusted-sender downgrade and extra threat signals in api/main.py and api/trust.py. A retrain on representative legitimate mail is still required."
-  ]
+  ],
+  "confidence_threshold": 0.7
 }

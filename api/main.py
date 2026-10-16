@@ -74,8 +74,8 @@ DISTILBERT_CONFIG_PATH = MODELS_DIR / "distilbert_config.json"
 DISTILBERT_MODEL_PATH = MODELS_DIR / "distilbert_tier1.pt"
 DISTILBERT_TOKENIZER_PATH = MODELS_DIR / "distilbert_tokenizer"
 DISTILBERT_RELEASE_URL = (
-    "https://github.com/ramanan-2735/NETRA-The-AI-Eye-Against-Phishing/"
-    "releases/download/v2.0.0/distilbert_tier1.pt"
+    "https://github.com/dhruvp-dev/NETRA-The-AI-Eye-Against-Phishing/"
+    "releases/download/V3.0/distilbert_tier1.pt"
 )
 
 # ---------------------------------------------------------------------------
