@@ -30,7 +30,31 @@ const signalUrlsStatus = document.getElementById("signal-urls-status");
 
 const inferenceTimeBadge = document.getElementById("inference-time-badge");
 
+// Explanation Elements
+const btnExplain = document.getElementById("btn-explain");
+const explainContainer = document.getElementById("explain-container");
+const explainSummary = document.getElementById("explain-summary");
+const factorBar = document.getElementById("factor-bar");
+const factorList = document.getElementById("factor-list");
+const tokensPhish = document.getElementById("tokens-phish");
+const tokensLegit = document.getElementById("tokens-legit");
+const btnHighlight = document.getElementById("btn-highlight");
+const btnClearHighlight = document.getElementById("btn-clear-highlight");
+const explainNote = document.getElementById("explain-note");
+
+// /explain runs Integrated Gradients: a few seconds on CPU, longer for long emails.
+const EXPLAIN_TIMEOUT_MS = 60000;
+const FACTOR_COLORS = {
+  wording: "var(--color-brand-violet)",
+  links: "var(--color-phish-red)",
+  sender_auth: "var(--color-warn-amber)",
+  reply_to: "var(--color-signal-blue)"
+};
+
 let currentActiveTab = null;
+let lastExtracted = null;    // email fetched from the open Gmail / Outlook tab
+let lastPayload = null;      // payload of the last /predict call
+let lastExplanation = null;
 
 // Initialize on load
 document.addEventListener("DOMContentLoaded", async () => {
@@ -59,6 +83,9 @@ function setupEventListeners() {
   if (btnAutofetchEmail) {
     btnAutofetchEmail.addEventListener("click", handleAutofetchEmail);
   }
+  btnExplain.addEventListener("click", handleExplain);
+  btnHighlight.addEventListener("click", handleHighlight);
+  btnClearHighlight.addEventListener("click", handleClearHighlight);
 }
 
 async function checkServerHealth() {
@@ -218,6 +245,7 @@ async function handleAutofetchEmail() {
     const response = results && results[0] ? results[0].result : null;
 
     if (response && response.found) {
+      lastExtracted = response;
       if (response.sender) inputSender.value = response.sender;
       if (response.subject) inputSubject.value = response.subject;
       if (response.body_text) inputBody.value = response.body_text;
@@ -255,7 +283,8 @@ async function handleEmailScan() {
     subject: subject,
     body_text: bodyText || subject,
     sender: sender,
-    urls: []
+    // Links found in the fetched email, as long as the user has not replaced its body.
+    urls: fetchedEmailUnchanged() ? (lastExtracted.urls || []).slice(0, 50) : []
   };
 
   btnScanEmail.disabled = true;
@@ -282,6 +311,8 @@ async function runInference(payload) {
     }
 
     const data = await res.json();
+    lastPayload = payload;
+    resetExplanation();
     displayResults(data);
   } catch (err) {
     alert(`Failed to connect to NETRA backend (${API_BASE}).\nPlease ensure "python -m uvicorn api.main:app --port 8000" is running.`);
@@ -361,4 +392,171 @@ function displayResults(data) {
 
   // Smooth scroll to results
   resultsContainer.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// ---------------------------------------------------------------------------
+// Explanation (POST /explain)
+// ---------------------------------------------------------------------------
+function fetchedEmailUnchanged() {
+  return Boolean(lastExtracted && lastExtracted.body_text &&
+                 inputBody.value.trim() === lastExtracted.body_text.trim());
+}
+
+function resetExplanation() {
+  lastExplanation = null;
+  explainContainer.classList.add("hidden");
+  btnExplain.disabled = false;
+  btnExplain.textContent = "Why this verdict?";
+}
+
+async function handleExplain() {
+  if (!lastPayload) return;
+  btnExplain.disabled = true;
+  btnExplain.textContent = "Explaining… (a few seconds)";
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), EXPLAIN_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}/explain`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...lastPayload, top_k: 8 }),
+      signal: controller.signal
+    });
+    if (res.status === 429) {
+      throw new Error("Too many explanations this minute. Try again shortly.");
+    }
+    if (!res.ok) {
+      throw new Error(`Explain error: HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    lastExplanation = data.explanation;
+    renderExplanation(data.explanation);
+    btnExplain.textContent = "Explanation";
+  } catch (err) {
+    btnExplain.disabled = false;
+    btnExplain.textContent = "Why this verdict?";
+    alert(err.name === "AbortError" ? "The explanation took too long." : err.message);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function formatPoints(contribution) {
+  const pts = Math.abs(contribution * 100);
+  const sign = contribution >= 0 ? "+" : "−";
+  return `${sign}${pts < 0.1 ? pts.toFixed(2) : pts.toFixed(1)} pts`;
+}
+
+function renderExplanation(x) {
+  explainContainer.classList.remove("hidden");
+  explainSummary.textContent = x.summary;
+
+  factorBar.replaceChildren();
+  factorList.replaceChildren();
+  for (const f of x.threat_factors) {
+    const color = FACTOR_COLORS[f.key] || "var(--color-slate)";
+    if (f.share) {
+      const seg = el("span");
+      seg.style.width = `${f.share}%`;
+      seg.style.background = color;
+      seg.title = `${f.label}: ${f.share.toFixed(0)}%`;
+      factorBar.appendChild(seg);
+    }
+
+    const row = el("li", "factor-row");
+    const head = el("div", "factor-head");
+    const swatch = el("span", "factor-swatch");
+    swatch.style.background = color;
+    head.append(swatch, el("span", "", f.label));
+    const badgeText = f.share ? `${f.share.toFixed(0)}%` : formatPoints(f.contribution);
+    head.appendChild(el("span", f.contribution < 0 ? "factor-badge lowers" : "factor-badge", badgeText));
+    row.appendChild(head);
+    if (f.evidence && f.evidence.length) {
+      row.appendChild(el("div", "factor-evidence", f.evidence.join(" · ")));
+    }
+    factorList.appendChild(row);
+  }
+
+  renderTokens(tokensPhish, x.top_phishing_tokens, "220, 38, 38");
+  renderTokens(tokensLegit, x.top_legitimate_tokens, "16, 185, 129");
+
+  const notes = [];
+  if (x.override) notes.push("Verdict raised by the multi-signal rule.");
+  if (x.truncated) notes.push("Only the first 256 tokens were analysed.");
+  if (!x.converged) notes.push("Approximate: attribution did not fully converge.");
+  if (x.method === "signals_only") notes.push("Fallback model: only rule signals are explained.");
+  notes.push(`${(x.explain_time_ms / 1000).toFixed(1)} s`);
+  explainNote.textContent = notes.join(" ");
+
+  const canHighlight = fetchedEmailUnchanged() &&
+    ["Gmail", "Outlook"].includes(lastExtracted.source) &&
+    highlightPayload().length > 0;
+  btnHighlight.disabled = !canHighlight;
+  btnClearHighlight.disabled = !canHighlight;
+  btnHighlight.title = canHighlight ? "" : "Fetch the open Gmail / Outlook email (unchanged) to highlight it";
+
+  explainContainer.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function renderTokens(container, tokens, rgb) {
+  container.replaceChildren();
+  if (!tokens.length) {
+    container.appendChild(el("span", "token-empty", "None"));
+    return;
+  }
+  const max = Math.max(...tokens.map(t => Math.abs(t.attribution)));
+  for (const t of tokens) {
+    const alpha = 0.15 + 0.6 * Math.abs(t.attribution) / (max || 1);
+    const chip = el("span", "token-chip", t.occurrences > 1 ? `${t.text} ×${t.occurrences}` : t.text);
+    chip.style.background = `rgba(${rgb}, ${alpha.toFixed(2)})`;
+    chip.title = `${t.segment} · ${t.attribution >= 0 ? "+" : ""}${t.attribution.toFixed(3)}`;
+    container.appendChild(chip);
+  }
+}
+
+// Body words only: subject and URL text are not inside the message body element.
+function highlightPayload() {
+  if (!lastExplanation) return [];
+  const pick = (list) => list.filter(t => t.segment === "body")
+    .map(t => ({ text: t.text, attribution: t.attribution }));
+  return [...pick(lastExplanation.top_phishing_tokens), ...pick(lastExplanation.top_legitimate_tokens)];
+}
+
+async function sendToPage(message) {
+  try {
+    return await chrome.tabs.sendMessage(currentActiveTab.id, message);
+  } catch (err) {
+    // Content script not present (tab opened before the extension loaded): inject it once, retry.
+    await chrome.scripting.executeScript({ target: { tabId: currentActiveTab.id }, files: ["content.js"] });
+    return await chrome.tabs.sendMessage(currentActiveTab.id, message);
+  }
+}
+
+async function handleHighlight() {
+  if (!lastExplanation || !currentActiveTab) return;
+  try {
+    const res = await sendToPage({ action: "highlightTokens", tokens: highlightPayload() });
+    explainNote.textContent = res && res.found
+      ? `Highlighted ${res.marked} word${res.marked === 1 ? "" : "s"} in the open email.`
+      : "Could not find the open email body on the page.";
+  } catch (err) {
+    explainNote.textContent = "Could not highlight on this page.";
+  }
+}
+
+async function handleClearHighlight() {
+  if (!currentActiveTab) return;
+  try {
+    await sendToPage({ action: "clearHighlights" });
+  } catch (err) {
+    // nothing to clear
+  }
 }

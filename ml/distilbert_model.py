@@ -34,3 +34,9 @@ class PhishingClassifier(nn.Module):
         cls = self.distilbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0, :]
         hdr = torch.relu(self.header_proj(header_features))
         return self.classifier(torch.cat([cls, hdr], dim=1))
+
+    def forward_embeds(self, inputs_embeds, attention_mask, header_features):
+        """Same as forward(), starting from word embeddings. Used by ml/explain.py for input gradients."""
+        cls = self.distilbert(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state[:, 0, :]
+        hdr = torch.relu(self.header_proj(header_features))
+        return self.classifier(torch.cat([cls, hdr], dim=1))

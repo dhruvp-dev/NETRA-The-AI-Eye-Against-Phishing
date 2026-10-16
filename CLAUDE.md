@@ -35,20 +35,33 @@ with RFC header features, served by FastAPI, with a calibrated Random Forest as 
 ### Core Components
 
 1. **API (`api/main.py`)**
-   - FastAPI on port `8000`. Endpoints: `GET /health`, `POST /predict`, `POST /admin/recalibrate`.
+   - FastAPI on port `8000`. Endpoints: `GET /health`, `POST /predict`, `POST /explain`, `POST /admin/recalibrate`.
    - Loads DistilBERT (`ml/models/distilbert_tier1.pt`). Falls back to the calibrated RF
      (`tier1_model_calibrated.pkl` or `tier1_model.pkl`) if DistilBERT is unavailable.
    - Inference runs in a worker thread (`asyncio.to_thread`) behind a semaphore (`NETRA_MAX_CONCURRENCY`).
    - Weights missing at startup are downloaded from GitHub Release `v2.0.0`, verified by SHA-256
      (`weights_sha256` in `distilbert_config.json`), then atomically moved into place.
-2. **Rate limiter (`api/rate_limiter.py`)**
-   - Sliding window, 20 requests/minute per client, on `/predict` and `/admin/recalibrate`.
+2. **Explanations (`ml/explain.py`, `api/xai.py`)**
+   - `POST /explain` takes the `/predict` body plus `top_k`. It returns the `/predict` fields plus an `explanation`.
+   - `ml/explain.py`: Integrated Gradients over word embeddings and header features together. The target is the
+     logit margin. The baseline replaces content tokens with `[SEP]` and uses "no headers" for the header input.
+     Steps are placed adaptively (refined forward scan) because F jumps sharply along the path.
+     Uses `PhishingClassifier.forward_embeds`.
+   - `api/xai.py`: the model part (p_m − p0) and the override part (p_f − p_m, split equally per counted
+     signal unit) are reported per threat factor. Invariant: `baseline_score + Σ contributions = risk_score`.
+   - `/explain` has its own one-slot semaphore and a 5/min limit on top of the shared one.
+     It takes seconds on CPU and never runs inside `/predict`.
+3. **Rate limiter (`api/rate_limiter.py`)**
+   - Sliding window, 20 requests/minute per client, on `/predict`, `/explain` and `/admin/recalibrate`.
    - Memory is bounded (LRU cap plus expiry sweep).
-3. **Shared model code (`ml/distilbert_model.py`, `ml/features/*`)**
+4. **Shared model code (`ml/distilbert_model.py`, `ml/features/*`)**
    - `PhishingClassifier` is defined once. Training and serving import it. Module names are part of the state dict.
-   - `text_builder.py` builds the model input. Training and serving must use it.
-4. **Chrome Extension (`extension/`)**
+   - `text_builder.py` builds the model input. Training and serving must use it. `build_model_text_with_spans`
+     also returns where each field sits in that text (used by `/explain`). `build_model_text` wraps it.
+5. **Chrome Extension (`extension/`)**
    - Manifest V3. Scans Gmail and active pages. Reads `classification`, `risk_score`, `signals` and `processing_time_ms` from `/predict`. Keep these fields stable.
+   - "Why this verdict?" calls `/explain`. `content.js` handles `highlightTokens` / `clearHighlights` in the open
+     Gmail / Outlook body (DOM APIs only, no `innerHTML`).
 
 ---
 
@@ -64,6 +77,7 @@ python -m uvicorn api.main:app --reload --port 8000
 # Tests
 pytest tests/                                   # unit + API tests, no weights needed
 python tests/stress_test_tier1.py               # end-to-end verdicts + latency; needs weights; exit 1 on failure
+python tests/xai_sanity.py                      # /explain deletion, randomisation, completeness, latency; needs weights
 ```
 
 ### Training and calibration
@@ -117,12 +131,14 @@ NETRA/
 ├── BUGFIX_PLAN.md                   # Bug-fix plan (from bugs/ reports)
 ├── requirements.txt                 # Python dependencies (tested versions)
 ├── api/
-│   ├── main.py                      # FastAPI app: /health, /predict, /admin/recalibrate
+│   ├── main.py                      # FastAPI app: /health, /predict, /explain, /admin/recalibrate
+│   ├── xai.py                       # /explain fusion: threat factors, Shapley override split, schemas, summary
 │   └── rate_limiter.py              # Sliding-window limiter with bounded memory
 ├── ml/
 │   ├── data_pipeline.py             # Raw corpora → unified.csv (schema, labels, splits)
 │   ├── train_distilbert.py          # Tier-1 DistilBERT training (shared with notebooks)
 │   ├── distilbert_model.py          # PhishingClassifier (shared by training and API)
+│   ├── explain.py                   # Integrated Gradients for PhishingClassifier (/explain)
 │   ├── calibrate_threshold.py       # Threshold sweep on val probabilities
 │   ├── train.py                     # RF fallback training (LR / calibrated SVM / RF)
 │   ├── features/
@@ -141,7 +157,9 @@ NETRA/
 │   ├── conftest.py                  # Adds project root to sys.path
 │   ├── test_api.py                  # API behaviour (health, validation, limits, auth, decisions)
 │   ├── test_features.py             # Features, pipeline parsing, splits, sweep, limiter
-│   └── stress_test_tier1.py         # End-to-end verdict + latency script (not collected by pytest)
+│   ├── test_explain.py              # IG engine (tiny random model) + fusion algebra
+│   ├── stress_test_tier1.py         # End-to-end verdict + latency script (not collected by pytest)
+│   └── xai_sanity.py                # /explain faithfulness + latency script (not collected by pytest)
 └── docs/                            # Decisions and design notes
 ```
 
@@ -153,7 +171,8 @@ NETRA/
 |---|---|---|
 | `NETRA_ADMIN_TOKEN` | unset | Bearer token for `/admin/recalibrate`. Unset means the endpoint returns 404. |
 | `NETRA_TRUSTED_PROXY_HOPS` | `0` | Proxies in front of the API. Cloud Run: `1`. `0` ignores `X-Forwarded-For`. |
-| `NETRA_MAX_CONCURRENCY` | `2` | Concurrent model inferences. |
+| `NETRA_MAX_CONCURRENCY` | `2` | Concurrent model inferences (`/predict`). `/explain` has its own single slot. |
+| `NETRA_XAI_STEPS` | `32` | Integrated Gradients steps for `/explain`, clamped to 8..64. |
 
 ---
 

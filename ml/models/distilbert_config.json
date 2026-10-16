@@ -2,9 +2,9 @@
   "model": "distilbert-base-uncased",
   "max_length": 256,
   "confidence_threshold": 0.7,
-  "weights_sha256": "b5df43f2ed5b747a6c16ea190415e9d79c53a750efa68c92a44497429333b3c0",
-  "header_features_trained": false,
-  "text_format": "body_only",
+  "weights_sha256": "653ebaf339448b45044e7e90cb25a034c89c37c46b43279c83966d2466059aaa",
+  "header_features_trained": true,
+  "text_format": "v3",
   "header_features": [
     "spf_pass",
     "spf_fail",
@@ -17,9 +17,9 @@
     "dmarc_none",
     "sender_domain_matches_reply_to"
   ],
-  "best_val_f1": 0.9993,
-  "best_val_recall": 0.9992,
-  "best_val_fpr": 0.0182,
+  "best_val_f1": 0.9919,
+  "best_val_recall": 0.9894,
+  "best_val_fpr": 0.0037,
   "training_history": [
     {
       "epoch": 1,
@@ -51,5 +51,202 @@
       "fpr": 0.0182,
       "pr_auc": 1.0
     }
-  ]
+  ],
+  "best_epoch": 3,
+  "best_val_pr_auc": 0.9995,
+  "val_metrics": {
+    "n": 8502,
+    "n_legitimate": 5092,
+    "n_malicious": 3410,
+    "accuracy": 0.9935,
+    "precision": 0.9944,
+    "recall": 0.9894,
+    "f1": 0.9919,
+    "fpr": 0.0037,
+    "pr_auc": 0.9995,
+    "url_only_recall": 1.0
+  },
+  "test_metrics": {
+    "test_std": {
+      "n": 8502,
+      "n_legitimate": 5092,
+      "n_malicious": 3410,
+      "accuracy": 0.9921,
+      "precision": 0.9938,
+      "recall": 0.9865,
+      "f1": 0.9901,
+      "fpr": 0.0041,
+      "pr_auc": 0.9992,
+      "by_source": {
+        "ceas_08": {
+          "n": 3486,
+          "n_legitimate": 1802,
+          "n_malicious": 1684,
+          "accuracy": 0.9954,
+          "precision": 0.9964,
+          "recall": 0.9941,
+          "f1": 0.9952,
+          "fpr": 0.0033,
+          "pr_auc": 0.9998
+        },
+        "enron": {
+          "n": 3006,
+          "n_legitimate": 3006,
+          "n_malicious": 0,
+          "accuracy": 0.996,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "fpr": 0.004,
+          "pr_auc": null
+        },
+        "nazario": {
+          "n": 184,
+          "n_legitimate": 0,
+          "n_malicious": 184,
+          "accuracy": 0.9783,
+          "precision": 1.0,
+          "recall": 0.9783,
+          "f1": 0.989,
+          "fpr": 0.0,
+          "pr_auc": null
+        },
+        "nigerian_fraud": {
+          "n": 345,
+          "n_legitimate": 0,
+          "n_malicious": 345,
+          "accuracy": 0.9884,
+          "precision": 1.0,
+          "recall": 0.9884,
+          "f1": 0.9942,
+          "fpr": 0.0,
+          "pr_auc": null
+        },
+        "phishing_pot": {
+          "n": 1011,
+          "n_legitimate": 0,
+          "n_malicious": 1011,
+          "accuracy": 0.9931,
+          "precision": 1.0,
+          "recall": 0.9931,
+          "f1": 0.9965,
+          "fpr": 0.0,
+          "pr_auc": null
+        },
+        "spamassassin": {
+          "n": 470,
+          "n_legitimate": 284,
+          "n_malicious": 186,
+          "accuracy": 0.9489,
+          "precision": 0.9821,
+          "recall": 0.8871,
+          "f1": 0.9322,
+          "fpr": 0.0106,
+          "pr_auc": 0.9932
+        }
+      },
+      "by_label_origin": {
+        "ham": {
+          "n": 5092,
+          "n_legitimate": 5092,
+          "n_malicious": 0,
+          "accuracy": 0.9959,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "fpr": 0.0041,
+          "pr_auc": null
+        },
+        "phish": {
+          "n": 3224,
+          "n_legitimate": 0,
+          "n_malicious": 3224,
+          "accuracy": 0.9922,
+          "precision": 1.0,
+          "recall": 0.9922,
+          "f1": 0.9961,
+          "fpr": 0.0,
+          "pr_auc": null
+        },
+        "spam": {
+          "n": 186,
+          "n_legitimate": 0,
+          "n_malicious": 186,
+          "accuracy": 0.8871,
+          "precision": 1.0,
+          "recall": 0.8871,
+          "f1": 0.9402,
+          "fpr": 0.0,
+          "pr_auc": null
+        }
+      },
+      "url_only_recall": 1.0,
+      "n_url_only": 31
+    },
+    "test_cross": {
+      "n": 2858,
+      "n_legitimate": 2400,
+      "n_malicious": 458,
+      "accuracy": 0.9521,
+      "precision": 0.9397,
+      "recall": 0.7489,
+      "f1": 0.8335,
+      "fpr": 0.0092,
+      "pr_auc": 0.9237,
+      "by_source": {
+        "ling": {
+          "n": 2858,
+          "n_legitimate": 2400,
+          "n_malicious": 458,
+          "accuracy": 0.9521,
+          "precision": 0.9397,
+          "recall": 0.7489,
+          "f1": 0.8335,
+          "fpr": 0.0092,
+          "pr_auc": 0.9237
+        }
+      },
+      "by_label_origin": {
+        "ham": {
+          "n": 2400,
+          "n_legitimate": 2400,
+          "n_malicious": 0,
+          "accuracy": 0.9908,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "fpr": 0.0092,
+          "pr_auc": null
+        },
+        "phish": {
+          "n": 458,
+          "n_legitimate": 0,
+          "n_malicious": 458,
+          "accuracy": 0.7489,
+          "precision": 1.0,
+          "recall": 0.7489,
+          "f1": 0.8564,
+          "fpr": 0.0,
+          "pr_auc": null
+        }
+      },
+      "url_only_recall": null,
+      "n_url_only": 0
+    }
+  },
+  "training": {
+    "epochs": 3,
+    "batch_size": 32,
+    "grad_accum": 1,
+    "effective_batch_size": 32,
+    "lr": 2e-05,
+    "max_length": 256,
+    "precision": "bf16",
+    "seed": 42,
+    "patience": 1,
+    "max_train_rows": null,
+    "data": "data/processed/unified.csv",
+    "pipeline_version": "4",
+    "trained_at": "2026-10-16T10:39:50.696251+00:00"
+  }
 }
