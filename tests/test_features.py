@@ -205,3 +205,110 @@ def test_rate_limiter_retry_after():
     assert lim.check("a") == (True, 0)
     allowed, retry = lim.check("a")
     assert allowed is False and retry >= 60
+
+
+# ---------------------------------------------------------------------------
+# Local-training additions: caps, near-duplicates, new readers, label origin
+# ---------------------------------------------------------------------------
+def test_reservoir_sample_size_and_determinism():
+    import random
+    import ml.data_pipeline as dp
+    a = dp.reservoir_sample(range(1000), 50, random.Random(7))
+    b = dp.reservoir_sample(range(1000), 50, random.Random(7))
+    assert len(a) == 50 and a == b
+    assert len(set(a)) == 50
+    assert dp.reservoir_sample(range(10), 50, random.Random(1)) == list(range(10))
+
+
+def test_reservoir_sample_is_not_first_n():
+    import random
+    import ml.data_pipeline as dp
+    s = dp.reservoir_sample(range(10000), 100, random.Random(3))
+    assert max(s) > 1000          # a 'first N' sample would max out at 99
+
+
+def test_body_hash_ignores_urls_and_digits_but_not_wording():
+    import ml.data_pipeline as dp
+    a = dp.body_hash("Verify at http://x.example.tk/a now. Ref 12345")
+    b = dp.body_hash("Verify at http://y.example.ml/zz now. Ref 99")
+    c = dp.body_hash("Please call the office tomorrow")
+    assert a == b
+    assert a != c
+
+
+def test_url_only_records_keep_distinct_hashes():
+    import ml.data_pipeline as dp
+    r1 = dp._url_only_record("p1", "phishtank", "http://a.example.tk/x")
+    r2 = dp._url_only_record("p2", "phishtank", "http://b.example.tk/y")
+    assert r1["_body_hash"] != r2["_body_hash"]
+
+
+def test_read_labeled_csv_maps_labels_and_skips_unknown(tmp_path):
+    import ml.data_pipeline as dp
+    p = tmp_path / "CEAS_08.csv"
+    p.write_text(
+        "sender,subject,body,label\n"
+        "a@x.com,Hi,Lunch at noon,0\n"
+        "b@y.biz,Verify,Click http://evil.example.tk now,1\n"
+        "c@z.net,Odd,Some text,maybe\n",
+        encoding="utf-8")
+    recs = dp.read_labeled_csv(p, source="ceas_08")
+    assert [r["label"] for r in recs] == [0, 1]
+    assert all(r["source"] == "ceas_08" for r in recs)
+    assert "http://evil.example.tk" in recs[1]["urls"]
+
+
+def test_read_labeled_csv_requires_body_and_label(tmp_path):
+    import ml.data_pipeline as dp
+    p = tmp_path / "Ling.csv"
+    p.write_text("foo,bar\n1,2\n", encoding="utf-8")
+    assert dp.read_labeled_csv(p, source="ling") == []
+
+
+def test_read_eml_folder_recursive_finds_nested_eml(tmp_path):
+    import ml.data_pipeline as dp
+    (tmp_path / "2024" / "08").mkdir(parents=True)
+    msg = b"From: a@b.com\nSubject: Hi\n\nBody text\n"
+    (tmp_path / "2024" / "08" / "one.eml").write_bytes(msg)
+    (tmp_path / "two.eml").write_bytes(msg)
+    (tmp_path / "notes.txt").write_bytes(msg)
+    recs = dp.read_eml_folder(tmp_path, "phishing_pot", label=1, recursive=True)
+    assert len(recs) == 2
+    assert all(r["label"] == 1 and r["source"] == "phishing_pot" for r in recs)
+
+
+def test_label_origin_mapping_for_new_sources():
+    import pandas as pd
+    import ml.data_pipeline as dp
+    df = pd.DataFrame([
+        {"source": "phishing_pot", "label": 1},
+        {"source": "ceas_08", "label": 1},
+        {"source": "ceas_08", "label": 0},
+        {"source": "enron", "label": 0},
+        {"source": "spamassassin", "label": 1},
+    ])
+    assert dp.add_label_origin(df)["label_origin"].tolist() == ["phish", "phish", "ham", "ham", "spam"]
+
+
+def test_cross_source_override_validates():
+    import pandas as pd
+    import pytest
+    import ml.data_pipeline as dp
+    df = pd.DataFrame(
+        [{"source": "enron", "label": 0}] * 5 + [{"source": "nazario", "label": 1}] * 5
+        + [{"source": "spamassassin", "label": 0}] * 3 + [{"source": "spamassassin", "label": 1}] * 3)
+    assert dp._pick_cross_source(df, forced="spamassassin")[0] == "spamassassin"
+    with pytest.raises(ValueError):
+        dp._pick_cross_source(df, forced="enron")     # single-class holdout
+    with pytest.raises(ValueError):
+        dp._pick_cross_source(df, forced="missing")
+
+
+def test_stratified_indices_keeps_both_classes_and_size():
+    import numpy as np
+    from ml.train_distilbert import stratified_indices
+    labels = np.array([0] * 900 + [1] * 100)
+    idx = stratified_indices(labels, 100, seed=1)
+    assert abs(len(idx) - 100) <= 2
+    assert set(np.unique(labels[idx])) == {0, 1}
+    assert len(stratified_indices(labels, 5000, seed=1)) == 1000

@@ -4,14 +4,20 @@ NETRA - DistilBERT Tier-1 Training Script
 ==========================================
 Fine-tunes distilbert-base-uncased for phishing detection.
 
-Run (examples):
-    python ml/train_distilbert.py --data data/processed/unified.csv
-    python ml/train_distilbert.py --epochs 3 --batch_size 16 --fp16 --seed 42
+Examples:
+    # Full run on a local NVIDIA GPU (bf16 is chosen automatically on Ampere, e.g. RTX 3060)
+    python ml/train_distilbert.py --epochs 3 --batch_size 32 --grad_accum 1 --seed 42
 
-Outputs (in ml/models/):
+    # Out of memory? Halve the batch and accumulate to keep the same effective batch size
+    python ml/train_distilbert.py --batch_size 16 --grad_accum 2
+
+    # Smoke run into a scratch folder (never touches the shipped weights)
+    python ml/train_distilbert.py --max_train_rows 2000 --epochs 1 --output_dir ml/models/_smoke
+
+Outputs (in --output_dir, default ml/models/):
     distilbert_tier1.pt        -- model weights
     distilbert_tokenizer/      -- tokenizer folder
-    distilbert_config.json     -- inference configuration (merged, existing keys kept)
+    distilbert_config.json     -- inference configuration and training metadata (merged)
 
 Train/serve parity:
     * Text is built by ml.features.text_builder.build_model_text (same as api/main.py).
@@ -19,20 +25,21 @@ Train/serve parity:
     * The architecture is ml.distilbert_model.PhishingClassifier (same as api/main.py).
 
 Evaluation:
-    * Checkpoint selection uses VAL only.
-    * Reported test metrics use test_std and test_cross. URL-only rows are excluded
-      because they have no email body and would inflate the scores.
-
-SUSPICIOUS is an INFERENCE-TIME state only (threshold rules live in
-ml/models/threshold_config.json, see api/main.py).
+    * Checkpoint selection uses EMAIL rows of the validation split only (URL-only rows are not emails).
+      Score = PR-AUC, ties broken by F1.
+    * Reported test metrics use test_std and test_cross, email rows only, with breakdowns by source and
+      label_origin. URL-only recall is reported separately.
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
+import math
 import random
 import sys
+import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,18 +60,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths and defaults
 # ---------------------------------------------------------------------------
 MODELS_DIR = ROOT / "ml" / "models"
-EVAL_DIR = ROOT / "ml" / "evaluation"
 DATA_CSV = ROOT / "data" / "processed" / "unified.csv"
-WEIGHTS_PATH = MODELS_DIR / "distilbert_tier1.pt"
-TOKENIZER_DIR = MODELS_DIR / "distilbert_tokenizer"
-CONFIG_PATH = MODELS_DIR / "distilbert_config.json"
 
-# ---------------------------------------------------------------------------
-# Defaults (overridable from the command line)
-# ---------------------------------------------------------------------------
 CONFIDENCE_THRESHOLD = 0.70   # inference-time SUSPICIOUS band (kept for the config file)
 MAX_LENGTH = 256
 BATCH_SIZE = 32
@@ -73,13 +73,15 @@ LEARNING_RATE = 2e-5
 WARMUP_RATIO = 0.10
 WEIGHT_DECAY = 0.01
 SEED = 42
+PATIENCE = 1
+MIN_GROUP_ROWS = 20           # per-source / per-origin metrics are skipped below this size
 IMBALANCE_WARN_RATIO = 10.0
 TEXT_FORMAT = "v3"            # bump when build_model_text changes
 PRETRAINED = "distilbert-base-uncased"
 
 
 # ---------------------------------------------------------------------------
-# Reproducibility and device
+# Reproducibility, device, precision
 # ---------------------------------------------------------------------------
 def set_seed(seed: int) -> None:
     import torch
@@ -99,6 +101,28 @@ def pick_device():
     return torch.device("cpu")
 
 
+def pick_precision(device, requested: str = None, legacy_fp16: bool = False) -> str:
+    """
+    'fp32' | 'fp16' | 'bf16'. Auto: bf16 on CUDA GPUs that support it (Ampere+, e.g. RTX 3060),
+    fp16 on older CUDA GPUs, fp32 elsewhere. fp16/bf16 only apply on CUDA.
+    """
+    import torch
+    if device.type != "cuda":
+        return "fp32"
+    if requested:
+        if requested == "bf16" and not torch.cuda.is_bf16_supported():
+            raise ValueError("This GPU does not support bf16. Use --precision fp16 or fp32.")
+        return requested
+    if legacy_fp16:
+        return "fp16"
+    return "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+
+
+def autocast_dtype(precision: str):
+    import torch
+    return {"bf16": torch.bfloat16, "fp16": torch.float16}.get(precision)
+
+
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
@@ -112,11 +136,12 @@ def _model_text_row(row) -> str:
     return build_model_text(row.get("subject", ""), row.get("body_text", ""), urls)
 
 
-def load_split_frame(csv_path: Path, splits):
-    """Load unified.csv and return the requested splits with text, header features, labels."""
-    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+def load_split_frame(df: pd.DataFrame, splits):
+    """
+    Build model inputs for the requested splits from an already-loaded unified.csv.
+    Returns (frame, header_matrix). Rows of frame and header_matrix line up by position.
+    """
     df = df[df["split"].isin(splits)].reset_index(drop=True)
-
     texts = [_model_text_row(r) for _, r in df.iterrows()]
     hdr = np.array(
         [[float(extract_from_row(h, s, r)[k]) for k in HEADER_FEATURE_NAMES]
@@ -125,14 +150,32 @@ def load_split_frame(csv_path: Path, splits):
     )
     url_only = df["url_only"].astype(str).str.lower().eq("true").values \
         if "url_only" in df.columns else np.zeros(len(df), dtype=bool)
-
-    out = pd.DataFrame({
+    frame = pd.DataFrame({
         "split": df["split"].values,
         "label": df["label"].astype(int).values,
         "text": texts,
         "url_only": url_only,
+        "source": df["source"].astype(str).values if "source" in df.columns else "unknown",
+        "label_origin": df["label_origin"].astype(str).values if "label_origin" in df.columns else "unknown",
     })
-    return out, hdr
+    return frame, hdr
+
+
+def stratified_indices(labels: np.ndarray, n: int, seed: int) -> np.ndarray:
+    """
+    Positions of a class-proportional sample of size ~n. Used for smoke runs only.
+    Keeps at least one row of each class present.
+    """
+    labels = np.asarray(labels)
+    if n >= len(labels):
+        return np.arange(len(labels))
+    rng = np.random.default_rng(seed)
+    picked = []
+    for cls in np.unique(labels):
+        pos = np.flatnonzero(labels == cls)
+        k = max(1, int(round(n * len(pos) / len(labels))))
+        picked.append(rng.choice(pos, size=min(k, len(pos)), replace=False))
+    return np.sort(np.concatenate(picked))
 
 
 def class_balance_report(labels, name: str) -> None:
@@ -142,7 +185,7 @@ def class_balance_report(labels, name: str) -> None:
         log.warning(f"{name} has a single class; metrics for it are undefined.")
     elif max(n0, n1) / min(n0, n1) > IMBALANCE_WARN_RATIO:
         log.warning(f"{name} class ratio above {IMBALANCE_WARN_RATIO:.0f}:1. "
-                    "Check Enron/SpamAssassin ham is included.")
+                    "Check that legitimate mail is included.")
 
 
 class EncodedEmails:
@@ -193,7 +236,8 @@ def make_loader(encoded: EncodedEmails, tokenizer, batch_size, shuffle, num_work
 def classification_metrics(labels: np.ndarray, probs: np.ndarray, threshold: float = 0.5) -> dict:
     from sklearn.metrics import (accuracy_score, average_precision_score, f1_score,
                                  precision_score, recall_score)
-    preds = (probs >= threshold).astype(int)
+    labels = np.asarray(labels).astype(int)
+    preds = (np.asarray(probs) >= threshold).astype(int)
     fp = int(((preds == 1) & (labels == 0)).sum())
     tn = int(((preds == 0) & (labels == 0)).sum())
     has_both = len(np.unique(labels)) == 2
@@ -210,16 +254,28 @@ def classification_metrics(labels: np.ndarray, probs: np.ndarray, threshold: flo
     }
 
 
-def predict_probs(model, loader, device, use_amp: bool):
+def grouped_metrics(frame: pd.DataFrame, probs: np.ndarray, column: str) -> dict:
+    """Metrics per value of `column` for groups with at least MIN_GROUP_ROWS rows."""
+    out = {}
+    for value, idx in frame.groupby(column).indices.items():
+        if len(idx) < MIN_GROUP_ROWS:
+            continue
+        out[str(value)] = classification_metrics(frame["label"].values[idx], probs[idx])
+    return out
+
+
+def predict_probs(model, loader, device, amp_dtype=None):
+    """Returns (malicious probability, label) arrays in loader order."""
     import torch
     model.eval()
     probs_all, labels_all = [], []
-    with torch.no_grad():
+    ctx = (torch.autocast(device_type=device.type, dtype=amp_dtype)
+           if amp_dtype is not None else contextlib.nullcontext())
+    with torch.no_grad(), ctx:
         for batch in loader:
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                logits = model(batch["input_ids"].to(device),
-                               batch["attention_mask"].to(device),
-                               batch["header_features"].to(device))
+            logits = model(batch["input_ids"].to(device),
+                           batch["attention_mask"].to(device),
+                           batch["header_features"].to(device))
             probs_all.append(torch.softmax(logits.float(), dim=1)[:, 1].cpu().numpy())
             labels_all.append(batch["labels"].numpy())
     return np.concatenate(probs_all), np.concatenate(labels_all)
@@ -249,101 +305,159 @@ def train(args):
 
     set_seed(args.seed)
     device = pick_device()
-    use_amp = bool(args.fp16 and device.type == "cuda")
-    log.info(f"Device: {device} | fp16: {use_amp} | seed: {args.seed}")
+    precision = pick_precision(device, args.precision, legacy_fp16=args.fp16)
+    amp_dtype = autocast_dtype(precision)
+    out_dir = Path(args.output_dir)
+    weights_path = out_dir / "distilbert_tier1.pt"
+    tokenizer_dir = out_dir / "distilbert_tokenizer"
+    config_path = out_dir / "distilbert_config.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    effective_batch = args.batch_size * args.grad_accum
+    log.info(f"Device: {device} | precision: {precision} | seed: {args.seed} | output: {out_dir}")
+    log.info(f"Batch {args.batch_size} x accum {args.grad_accum} = effective {effective_batch}")
 
     tokenizer = AutoTokenizer.from_pretrained(PRETRAINED)
 
-    # --- Data ---
+    # --- Data: read the CSV once ---
+    raw = pd.read_csv(args.data, dtype=str, keep_default_na=False)
+    pipeline_version = raw["pipeline_version"].iloc[0] if "pipeline_version" in raw.columns else "unknown"
+    if pipeline_version != "4":
+        log.warning(f"unified.csv pipeline_version={pipeline_version}; expected 4. "
+                    "Rebuild it with ml/data_pipeline.py.")
     frames = {}
     for name, splits in {"train": ["train"], "val": ["val"],
                          "test_std": ["test_std"], "test_cross": ["test_cross"]}.items():
-        frames[name], hdr = load_split_frame(Path(args.data), splits)
-        frames[name + "_hdr"] = hdr
-    tr, va = frames["train"], frames["val"]
-    class_balance_report(tr["label"].values, "train")
-    class_balance_report(va["label"].values, "val")
+        frames[name] = load_split_frame(raw, splits)
+    del raw
 
-    def encoded_for(name):
-        f = frames[name]
-        return EncodedEmails(encode(f["text"].tolist(), tokenizer, args.max_length),
-                             frames[name + "_hdr"], f["label"].values)
+    tr, tr_hdr = frames["train"]
+    if args.max_train_rows:
+        keep = stratified_indices(tr["label"].values, args.max_train_rows, args.seed)
+        tr, tr_hdr = tr.iloc[keep].reset_index(drop=True), tr_hdr[keep]
+        log.info(f"Smoke sample: {len(tr):,} training rows (requested {args.max_train_rows:,})")
+    va, va_hdr = frames["val"]
+    class_balance_report(tr["label"].values, "train (email + url-only)")
+    class_balance_report(va["label"].values[~va["url_only"].values], "val (email rows)")
 
-    train_enc = encoded_for("train")
-    val_enc = encoded_for("val")
+    train_enc = EncodedEmails(encode(tr["text"].tolist(), tokenizer, args.max_length), tr_hdr, tr["label"].values)
+    val_enc = EncodedEmails(encode(va["text"].tolist(), tokenizer, args.max_length), va_hdr, va["label"].values)
+    lengths = np.array([len(x) for x in train_enc.input_ids])
+    log.info(f"Token length (train): p50={np.percentile(lengths, 50):.0f} "
+             f"p90={np.percentile(lengths, 90):.0f} p99={np.percentile(lengths, 99):.0f} "
+             f"(max_length={args.max_length})")
+
     train_loader = make_loader(train_enc, tokenizer, args.batch_size, shuffle=True)
     val_loader = make_loader(val_enc, tokenizer, args.batch_size * 2, shuffle=False)
+    email_val_mask = ~va["url_only"].values
+    if email_val_mask.sum() == 0 or len(np.unique(va["label"].values[email_val_mask])) < 2:
+        raise ValueError("Validation split needs email rows of both classes to select a checkpoint. "
+                         "Check the data pipeline output (ml/data_pipeline.py) and the sources it read.")
 
     # --- Model / loss / optimiser ---
     model = build_model().to(device)
     class_weights = compute_class_weight("balanced", classes=np.array([0, 1]), y=tr["label"].values)
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32).to(device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
-    total_steps = len(train_loader) * args.epochs
+    steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
+    total_steps = steps_per_epoch * args.epochs
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=int(WARMUP_RATIO * total_steps), num_training_steps=total_steps)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # Loss scaling is only needed for fp16. bf16 has fp32's exponent range.
+    scaler = torch.amp.GradScaler("cuda", enabled=(precision == "fp16"))
 
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    best_f1, best_epoch = -1.0, 0   # -1 so epoch 1 always saves a checkpoint
-    log.info(f"Epochs={args.epochs} | BatchSize={args.batch_size} | LR={args.lr} | MaxLen={args.max_length}")
+    best_key, best_epoch, best_val, bad_epochs = (-1.0, -1.0), 0, None, 0
+    log.info(f"Epochs={args.epochs} | LR={args.lr} | MaxLen={args.max_length} | patience={args.patience}")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        total_loss, n_batches = 0.0, 0
-        for batch in train_loader:
-            optimizer.zero_grad()
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+        optimizer.zero_grad()
+        total_loss, n_samples = 0.0, 0
+        t0 = time.time()
+        for step, batch in enumerate(train_loader, 1):
+            ctx = (torch.autocast(device_type=device.type, dtype=amp_dtype)
+                   if amp_dtype is not None else contextlib.nullcontext())
+            with ctx:
                 logits = model(batch["input_ids"].to(device),
                                batch["attention_mask"].to(device),
                                batch["header_features"].to(device))
                 loss = criterion(logits.float(), batch["labels"].to(device))
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            scaler.scale(loss / args.grad_accum).backward()
             total_loss += loss.item()
-            n_batches += 1
+            n_samples += batch["labels"].size(0)
+            if step % args.grad_accum == 0 or step == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+        elapsed = time.time() - t0
 
-        probs, labels = predict_probs(model, val_loader, device, use_amp)
-        m = classification_metrics(labels, probs)
-        log.info(f"Epoch {epoch}/{args.epochs} | loss={total_loss / max(n_batches, 1):.4f} | "
-                 f"val F1={m['f1']} P={m['precision']} R={m['recall']} FPR={m['fpr']} PR-AUC={m['pr_auc']}")
+        # Selection uses email rows only.
+        probs, labels = predict_probs(model, val_loader, device, amp_dtype)
+        m = classification_metrics(labels[email_val_mask], probs[email_val_mask])
+        url_only_val = ~email_val_mask
+        url_recall = (float(((probs[url_only_val] >= 0.5) & (labels[url_only_val] == 1)).sum()
+                            / max(((labels[url_only_val] == 1)).sum(), 1))
+                      if url_only_val.any() else None)
+        key = (m["pr_auc"] if m["pr_auc"] is not None else -1.0, m["f1"])
+        log.info(f"Epoch {epoch}/{args.epochs} | loss={total_loss / max(len(train_loader), 1):.4f} | "
+                 f"{n_samples / elapsed:.1f} samples/s | val(email) PR-AUC={m['pr_auc']} F1={m['f1']} "
+                 f"P={m['precision']} R={m['recall']} FPR={m['fpr']} | url-only recall={url_recall}")
 
-        if m["f1"] > best_f1:
-            best_f1, best_epoch = m["f1"], epoch
-            torch.save(model.state_dict(), WEIGHTS_PATH)
-            log.info(f"  New best checkpoint saved (val F1={best_f1:.4f})")
+        if key > best_key:
+            best_key, best_epoch, best_val = key, epoch, {**m, "url_only_recall": url_recall}
+            bad_epochs = 0
+            torch.save(model.state_dict(), weights_path)
+            log.info(f"  New best checkpoint saved (val PR-AUC={key[0]}, F1={key[1]})")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= args.patience:
+                log.info(f"Early stop: no val improvement for {bad_epochs} epoch(s).")
+                break
+
+    if device.type == "cuda":
+        log.info(f"Peak GPU memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
     # --- Reload best checkpoint (weights_only: no pickle code execution) ---
-    model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device, weights_only=True))
-    val_probs, val_labels = predict_probs(model, val_loader, device, use_amp)
-    val_metrics = classification_metrics(val_labels, val_probs)
+    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
 
-    # --- Held-out test metrics (URL-only rows excluded) ---
+    # --- Held-out test metrics: every row is scored, then split into email / URL-only ---
     test_metrics = {}
     for name in ("test_std", "test_cross"):
-        f = frames[name]
-        keep = ~f["url_only"].values
-        if keep.sum() == 0:
+        f, hdr = frames[name]
+        if len(f) == 0:
+            log.warning(f"{name}: empty split.")
+            continue
+        enc = EncodedEmails(encode(f["text"].tolist(), tokenizer, args.max_length), hdr, f["label"].values)
+        probs, labels = predict_probs(model, make_loader(enc, tokenizer, args.batch_size * 2, shuffle=False),
+                                      device, amp_dtype)
+        email = ~f["url_only"].values
+        url_only = ~email
+        if email.sum() == 0:
             log.warning(f"{name}: no email rows to evaluate.")
             continue
-        enc = EncodedEmails(
-            encode([t for t, k in zip(f["text"], keep) if k], tokenizer, args.max_length),
-            frames[name + "_hdr"][keep], f["label"].values[keep])
-        loader = make_loader(enc, tokenizer, args.batch_size * 2, shuffle=False)
-        p, y = predict_probs(model, loader, device, use_amp)
-        test_metrics[name] = classification_metrics(y, p)
-        class_balance_report(y, name)
-        log.info(f"{name}: {test_metrics[name]}")
+        e_frame = f[email].reset_index(drop=True)
+        e_probs, e_labels = probs[email], labels[email]
+        class_balance_report(e_labels, f"{name} (email rows)")
+        overall = classification_metrics(e_labels, e_probs)
+        url_recall = (float(((probs[url_only] >= 0.5) & (labels[url_only] == 1)).sum()
+                            / max((labels[url_only] == 1).sum(), 1)) if url_only.any() else None)
+        test_metrics[name] = {
+            **overall,
+            "by_source": grouped_metrics(e_frame, e_probs, "source"),
+            "by_label_origin": grouped_metrics(e_frame, e_probs, "label_origin"),
+            "url_only_recall": url_recall,
+            "n_url_only": int(url_only.sum()),
+        }
+        log.info(f"{name}: F1={overall['f1']} PR-AUC={overall['pr_auc']} FPR={overall['fpr']} "
+                 f"(n={overall['n']}, url-only recall={url_recall})")
 
     # --- Save tokenizer and config ---
-    tokenizer.save_pretrained(str(TOKENIZER_DIR))
-    weights_sha = sha256_of(WEIGHTS_PATH)
+    tokenizer.save_pretrained(str(tokenizer_dir))
+    weights_sha = sha256_of(weights_path)
 
-    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
     config.update({
         "model": PRETRAINED,
         "max_length": args.max_length,
@@ -352,25 +466,29 @@ def train(args):
         "header_features_trained": True,
         "text_format": TEXT_FORMAT,
         "best_epoch": best_epoch,
-        "best_val_f1": val_metrics["f1"],
-        "best_val_recall": val_metrics["recall"],
-        "best_val_fpr": val_metrics["fpr"],
-        "val_metrics": val_metrics,
+        "best_val_f1": best_val["f1"],
+        "best_val_recall": best_val["recall"],
+        "best_val_fpr": best_val["fpr"],
+        "best_val_pr_auc": best_val["pr_auc"],
+        "val_metrics": best_val,
         "test_metrics": test_metrics,
         "weights_sha256": weights_sha,
         "training": {
-            "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
-            "max_length": args.max_length, "fp16": use_amp, "seed": args.seed,
-            "data": str(args.data), "trained_at": datetime.now(timezone.utc).isoformat(),
+            "epochs": args.epochs, "batch_size": args.batch_size, "grad_accum": args.grad_accum,
+            "effective_batch_size": effective_batch, "lr": args.lr, "max_length": args.max_length,
+            "precision": precision, "seed": args.seed, "patience": args.patience,
+            "max_train_rows": args.max_train_rows, "data": str(args.data),
+            "pipeline_version": pipeline_version,
+            "trained_at": datetime.now(timezone.utc).isoformat(),
         },
     })
-    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     log.info("=" * 60)
-    log.info(f"Done. Best epoch {best_epoch}, val F1 {best_f1:.4f}")
-    log.info(f"Weights   : {WEIGHTS_PATH} (sha256 {weights_sha[:12]}...)")
-    log.info(f"Config    : {CONFIG_PATH}")
-    log.info("Next: python ml/calibrate_threshold.py  (sets thresholds from val probabilities)")
+    log.info(f"Done. Best epoch {best_epoch}. Val (email) PR-AUC {best_val['pr_auc']}, F1 {best_val['f1']}")
+    log.info(f"Weights   : {weights_path} (sha256 {weights_sha[:12]}...)")
+    log.info(f"Config    : {config_path}")
+    log.info("Next: calibrate thresholds with ml/calibrate_threshold.py")
     log.info("=" * 60)
     return model, tokenizer, config
 
@@ -378,13 +496,30 @@ def train(args):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="NETRA DistilBERT Training")
+    p.add_argument("--data", type=str, default=str(DATA_CSV), help="Path to unified.csv")
+    p.add_argument("--output_dir", type=str, default=str(MODELS_DIR),
+                   help="Where weights, tokenizer and config are written (default: ml/models)")
+    p.add_argument("--epochs", type=int, default=EPOCHS)
+    p.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    p.add_argument("--grad_accum", type=int, default=1,
+                   help="Accumulate gradients over N batches (same effective batch, less VRAM)")
+    p.add_argument("--lr", type=float, default=LEARNING_RATE)
+    p.add_argument("--max_length", type=int, default=MAX_LENGTH)
+    p.add_argument("--seed", type=int, default=SEED)
+    p.add_argument("--patience", type=int, default=PATIENCE,
+                   help="Stop after this many epochs without val improvement")
+    p.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default=None,
+                   help="Default: bf16 on Ampere+ GPUs, fp16 on older GPUs, fp32 on CPU")
+    p.add_argument("--fp16", action="store_true", help="Alias for --precision fp16 (kept for old commands)")
+    p.add_argument("--max_train_rows", type=int, default=None,
+                   help="Stratified subsample of train, for smoke runs only")
+    args = p.parse_args(argv)
+    if args.grad_accum < 1 or args.batch_size < 1:
+        p.error("--batch_size and --grad_accum must be >= 1")
+    return args
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="NETRA DistilBERT Training")
-    parser.add_argument("--data", type=str, default=str(DATA_CSV), help="Path to unified.csv")
-    parser.add_argument("--epochs", type=int, default=EPOCHS)
-    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
-    parser.add_argument("--max_length", type=int, default=MAX_LENGTH)
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--fp16", action="store_true", help="Mixed precision (CUDA only)")
-    train(parser.parse_args())
+    train(parse_args())

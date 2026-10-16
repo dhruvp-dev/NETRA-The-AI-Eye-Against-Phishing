@@ -92,9 +92,43 @@ def extract_urls(text: str) -> list:
 
 
 def body_hash(text: str) -> str:
-    """SHA-256 hash of normalised body text for deduplication."""
-    normalised = re.sub(r"\s+", " ", (text or "").strip().lower())
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+    """
+    Near-duplicate hash for deduplication (A2). Phishing campaigns send the same
+    email with different links or numbers, so URLs become <url>, digit runs become 0,
+    and case and whitespace are normalised before hashing.
+    """
+    t = (text or "").lower()
+    t = URL_PATTERN.sub("<url>", t)
+    t = re.sub(r"\d+", "0", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+
+def raw_hash(text: str) -> str:
+    """Exact hash, used where the identity is the string itself (e.g. a URL)."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def reservoir_sample(items, k: int, rng) -> list:
+    """
+    Uniform random sample of k items from an iterable of unknown length (Algorithm R).
+    Used for Enron so the 517k messages are never all held in memory (A1). Not 'first N':
+    Enron is ordered by mailbox, so the first N would be biased.
+    """
+    sample = []
+    for i, item in enumerate(items):
+        if i < k:
+            sample.append(item)
+        else:
+            j = rng.randint(0, i)
+            if j < k:
+                sample[j] = item
+    return sample
+
+
+PIPELINE_VERSION = 4          # bump when the schema or labelling changes (notebook uses it)
+DEFAULT_CAPS = {"enron": 30000, "phishtank": 8000}   # per-source row caps (A1)
+LABELED_CSV_ALLOWLIST = {"ceas_08", "nigerian_fraud", "ling"}   # Kaggle phishing-email-dataset files
 
 
 def _decode_header(raw) -> str:
@@ -222,7 +256,7 @@ def email_message_to_record(msg, source: str, label: int, record_id: str) -> dic
         "headers_available": json.dumps(headers_dict),
         "url_only": False,
         "split": "",           # assigned later
-        "_body_hash": body_hash(body_text),
+        "_body_hash": body_hash(subject + "\n" + body_text),
     }
 
 
@@ -252,7 +286,7 @@ def _url_only_record(record_id: str, source: str, url: str) -> dict:
         "headers_available": json.dumps({}),
         "url_only": True,
         "split": "",
-        "_body_hash": body_hash(url),   # hash of the URL, so distinct URLs do not collapse
+        "_body_hash": raw_hash(url),   # exact hash of the URL, so distinct URLs do not collapse
     }
 
 
@@ -277,14 +311,19 @@ def read_enron_mbox(path: Path, label: int = 0) -> list:
     return records
 
 
-def read_enron_csv(path: Path, label: int = 0) -> list:
+def read_enron_csv(path: Path, label: int = 0, cap: int = None, seed: int = 42) -> list:
     """
     Read Enron dataset from Kaggle CSV format.
     Expected columns: 'file' (path identifier) and 'message' (raw RFC-2822 text).
     All treated as legitimate (label=0).
     """
     import email as email_lib
+    import random
     records = []
+    candidates = []                 # streaming reservoir (raw messages), used only when capped
+    k = int(cap * 1.2) if cap is not None else 0   # headroom for dedup losses
+    seen = 0
+    rng = random.Random(seed)
     try:
         log.info(f"Reading Enron CSV: {path.name} ({path.stat().st_size // 1024 // 1024} MB)")
         chunk_size = 5000
@@ -301,41 +340,122 @@ def read_enron_csv(path: Path, label: int = 0) -> list:
                 raw_msg = row.get("message", "") or ""
                 if not raw_msg.strip():
                     continue
+                if cap is None:
+                    try:
+                        msg = email_lib.message_from_string(raw_msg)
+                    except Exception:
+                        continue
+                    rec = _safe_record(msg, "enron", label, f"enron_csv_{i:07d}")
+                    if rec:
+                        records.append(rec)
+                else:
+                    # Keep raw strings only; reservoir keeps a uniform sample without
+                    # holding all 517k messages in memory. Headroom covers dedup losses.
+                    seen += 1
+                    item = (f"enron_csv_{i:07d}", raw_msg)
+                    if len(candidates) < k:
+                        candidates.append(item)
+                    else:
+                        j = rng.randint(0, seen - 1)
+                        if j < k:
+                            candidates[j] = item
+            chunk_num += 1
+            if chunk_num % 10 == 0:
+                log.info(f"  Enron CSV: processed {chunk_num * chunk_size:,} rows...")
+        if cap is not None:
+            log.info(f"  Enron CSV: sampled {len(candidates):,} of {seen:,} messages (cap {cap:,})")
+            for record_id, raw_msg in candidates:
                 try:
                     msg = email_lib.message_from_string(raw_msg)
                 except Exception:
                     continue
-                rec = _safe_record(msg, "enron", label, f"enron_csv_{i:07d}")
+                rec = _safe_record(msg, "enron", label, record_id)
                 if rec:
                     records.append(rec)
-            chunk_num += 1
-            if chunk_num % 10 == 0:
-                log.info(f"  Enron CSV: processed {chunk_num * chunk_size:,} rows...")
     except Exception as e:
         log.error(f"Failed to read Enron CSV {path}: {e}")
     log.info(f"Enron CSV {path.name}: {len(records)} records")
     return records
 
 
-def read_spamassassin_eml_folder(folder: Path, label: int) -> list:
+def read_eml_folder(folder: Path, source: str, label: int, recursive: bool = False) -> list:
     """
-    Read SpamAssassin corpus from a folder of individual .eml files
-    (no extension). ham folders -> label=0, spam folders -> label=1.
+    Read a folder of raw email files.
+    recursive=False: every non-directory file (SpamAssassin uses extension-less names).
+    recursive=True:  only *.eml, searched in all subfolders (phishing_pot).
     """
     import email as email_lib
     records = []
-    for i, path in enumerate(folder.iterdir()):
-        if path.is_dir():
-            continue
+    paths = folder.rglob("*.eml") if recursive else folder.iterdir()
+    for i, path in enumerate(p for p in paths if not p.is_dir()):
         try:
             msg = email_lib.message_from_bytes(path.read_bytes())
         except Exception as e:
             log.debug(f"Skipping {path.name}: {e}")
             continue
-        rec = _safe_record(msg, "spamassassin", label, f"spamassassin_{folder.name}_{i:06d}")
+        rec = _safe_record(msg, source, label, f"{source}_{folder.name}_{i:06d}")
         if rec:
             records.append(rec)
-    log.info(f"SpamAssassin folder '{folder.name}': {len(records)} records, label={label}")
+    log.info(f"{source} folder '{folder.name}': {len(records)} records, label={label}")
+    return records
+
+
+def read_spamassassin_eml_folder(folder: Path, label: int) -> list:
+    """SpamAssassin corpus folder (ham -> label 0, spam -> label 1)."""
+    return read_eml_folder(folder, "spamassassin", label)
+
+
+# Label values that mean malicious / legitimate in the Kaggle phishing-email CSVs.
+_MALICIOUS_LABELS = {"1", "phishing", "spam", "malicious"}
+_LEGIT_LABELS = {"0", "legitimate", "ham", "safe"}
+
+
+def read_labeled_csv(path: Path, source: str) -> list:
+    """
+    Read a labelled email CSV (Kaggle phishing-email-dataset files).
+    Body: first of body / text_combined / text. Rows whose label cannot be read are skipped.
+    """
+    records = []
+    try:
+        df = pd.read_csv(path, dtype=str, keep_default_na=False, on_bad_lines="skip",
+                         encoding="utf-8", encoding_errors="replace")
+    except Exception as e:
+        log.error(f"Failed to read labelled CSV {path.name}: {e}")
+        return records
+    df.columns = [c.lower().strip() for c in df.columns]
+    body_col = next((c for c in ("body", "text_combined", "text") if c in df.columns), None)
+    if body_col is None or "label" not in df.columns:
+        log.warning(f"{path.name}: needs a body column and a label column; skipped")
+        return records
+    skipped = 0
+    for i, row in df.iterrows():
+        lab = str(row["label"]).strip().lower()
+        if lab in _MALICIOUS_LABELS:
+            label = 1
+        elif lab in _LEGIT_LABELS:
+            label = 0
+        else:
+            skipped += 1
+            continue
+        body = str(row[body_col]).strip()
+        subject = str(row.get("subject", "")).strip()
+        if not body and not subject:
+            continue
+        records.append({
+            "record_id": f"{source}_{i:07d}",
+            "source": source,
+            "label": label,
+            "subject": subject,
+            "body_text": body,
+            "urls": json.dumps(list(dict.fromkeys(extract_urls(body) + extract_urls(subject)))),
+            "sender": str(row.get("sender", "")).strip(),
+            "reply_to": "",
+            "headers_available": json.dumps({}),
+            "url_only": False,
+            "split": "",
+            "_body_hash": body_hash(subject + "\n" + body),
+        })
+    log.info(f"{path.name} -> source '{source}': {len(records)} records (skipped {skipped} unlabeled)")
     return records
 
 
@@ -385,7 +505,7 @@ def read_nazario_csv(path: Path) -> list:
                 "headers_available": json.dumps({}),
                 "url_only": False,
                 "split": "",
-                "_body_hash": body_hash(body_text),
+                "_body_hash": body_hash(subject + "\n" + body_text),
             })
     except Exception as e:
         log.error(f"Failed to read Nazario CSV {path}: {e}")
@@ -450,14 +570,15 @@ def read_openphish_txt(path: Path) -> list:
 
 def add_label_origin(df: pd.DataFrame) -> pd.DataFrame:
     """
-    label_origin: 'phish' (Nazario/PhishTank/OpenPhish), 'spam' (SpamAssassin spam,
-    label=1), or 'ham' (label=0). Lets evaluation separate spam from phishing.
+    label_origin: 'ham' (label=0), 'spam' (SpamAssassin spam, label=1), or 'phish' (every other
+    malicious row: Nazario, PhishTank, OpenPhish, phishing_pot and the labelled CSVs).
+    Lets evaluation separate spam from phishing.
     """
-    is_phish_source = df["source"].isin({"nazario", "phishtank", "openphish"})
+    is_spam = (df["source"] == "spamassassin") & (df["label"] == 1)
     df["label_origin"] = np.select(
-        [is_phish_source, df["label"] == 1],
-        ["phish", "spam"],
-        default="ham",
+        [df["label"] == 0, is_spam],
+        ["ham", "spam"],
+        default="phish",
     )
     return df
 
@@ -466,13 +587,22 @@ def add_label_origin(df: pd.DataFrame) -> pd.DataFrame:
 # Split assignment
 # ---------------------------------------------------------------------------
 
-def _pick_cross_source(df: pd.DataFrame):
+def _pick_cross_source(df: pd.DataFrame, forced: str = None):
     """
     Smallest source to hold out whole. Two conditions:
       * the held-out source contains BOTH labels (otherwise precision/FPR are undefined, ML9b);
       * the rows left for training/validation still contain BOTH labels
         (otherwise holding it out leaves the model with one class, e.g. no legitimate mail).
+    `forced` (--cross-source) overrides the automatic choice but must exist and be valid.
     """
+    if forced:
+        if forced not in set(df["source"]):
+            raise ValueError(f"--cross-source '{forced}' is not a source in the data")
+        held = set(df.loc[df["source"] == forced, "label"].unique())
+        rest = set(df.loc[df["source"] != forced, "label"].unique())
+        if held != {0, 1} or rest != {0, 1}:
+            raise ValueError(f"--cross-source '{forced}' must hold out both classes and leave both classes behind")
+        return forced, int((df["source"] == forced).sum())
     for source, count in df["source"].value_counts(ascending=True).items():
         held = df.loc[df["source"] == source, "label"]
         rest = df.loc[df["source"] != source, "label"]
@@ -481,7 +611,7 @@ def _pick_cross_source(df: pd.DataFrame):
     return None, 0
 
 
-def assign_splits(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
+def assign_splits(df: pd.DataFrame, seed: int = 42, cross_source: str = None) -> pd.DataFrame:
     """
     Assign train / val / test_std / test_ext / test_cross.
     - test_cross: the smallest source that contains both classes is held out whole.
@@ -492,7 +622,7 @@ def assign_splits(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
     df["split"] = ""
     rng = np.random.default_rng(seed)
 
-    cross_source, cross_count = _pick_cross_source(df)
+    cross_source, cross_count = _pick_cross_source(df, forced=cross_source)
     if cross_source is None:
         log.warning("No source contains both classes; test_cross split is empty.")
     else:
@@ -544,11 +674,27 @@ def discover_files() -> dict:
         "spamassassin_spam_folder": [],
         "phishtank_csv": [],
         "openphish_txt": [],
+        "labeled_csv": [],
+        "phishing_pot": [],
     }
 
     enron_csv = RAW_DIR / "emails.csv"
     if enron_csv.exists():
         files["enron_csv"].append(enron_csv)
+
+    # Kaggle phishing-email-dataset: only the allow-listed files (others are skipped on purpose,
+    # because they duplicate corpora already loaded or are not email bodies).
+    labeled_dir = RAW_DIR / "phishing_email_dataset"
+    if labeled_dir.is_dir():
+        for csv_path in sorted(labeled_dir.glob("*.csv")):
+            if csv_path.stem.lower() in LABELED_CSV_ALLOWLIST:
+                files["labeled_csv"].append(csv_path)
+            else:
+                log.info(f"Skipping {csv_path.name} (not in the allow-list)")
+
+    pot_dir = RAW_DIR / "phishing_pot"
+    if pot_dir.is_dir():
+        files["phishing_pot"].append(pot_dir)
 
     for folder_name in ["easy_ham", "hard_ham"]:
         folder = RAW_DIR / folder_name
@@ -590,19 +736,23 @@ def discover_files() -> dict:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(include_url_only: bool = True):
+def run_pipeline(include_url_only: bool = True, caps: dict = None,
+                 cross_source: str = None, seed: int = 42):
+    caps = dict(DEFAULT_CAPS if caps is None else caps)
     log.info("=" * 60)
     log.info("NETRA Data Pipeline starting")
     log.info(f"Raw data dir  : {RAW_DIR}")
     log.info(f"Output CSV    : {OUTPUT_CSV}")
     log.info(f"URL-only rows : {'included' if include_url_only else 'excluded'}")
+    log.info(f"Source caps   : {caps or 'none'}")
+    log.info(f"Cross source  : {cross_source or 'automatic'}")
     log.info("=" * 60)
 
     files = discover_files()
     all_records = []
 
     for path in files["enron_csv"]:
-        all_records.extend(read_enron_csv(path, label=0))
+        all_records.extend(read_enron_csv(path, label=0, cap=caps.get("enron"), seed=seed))
     for path in files["enron_mbox"]:
         all_records.extend(read_enron_mbox(path, label=0))
 
@@ -624,6 +774,11 @@ def run_pipeline(include_url_only: bool = True):
         all_records.extend(read_phishtank_csv(path))
     for path in files["openphish_txt"]:
         all_records.extend(read_openphish_txt(path))
+
+    for folder in files["phishing_pot"]:
+        all_records.extend(read_eml_folder(folder, "phishing_pot", label=1, recursive=True))
+    for path in files["labeled_csv"]:
+        all_records.extend(read_labeled_csv(path, source=path.stem.lower()))
 
     if not all_records:
         log.warning("No records found. Make sure datasets are placed in data/raw/")
@@ -647,7 +802,17 @@ def run_pipeline(include_url_only: bool = True):
     # --- Deduplicate on content hash ---
     before_dedup = len(df)
     df = df.drop_duplicates(subset=["_body_hash"]).reset_index(drop=True)
-    log.info(f"Removed {before_dedup - len(df)} duplicates. Remaining: {len(df)}")
+    log.info(f"Removed {before_dedup - len(df)} near-duplicates. Remaining: {len(df)}")
+
+    # --- Per-source caps after dedup (A1). Random sample, reproducible via seed. ---
+    kept = []
+    for source, group in df.groupby("source", sort=False):
+        cap = caps.get(source)
+        if cap is not None and len(group) > cap:
+            group = group.sample(n=cap, random_state=seed)
+            log.info(f"  cap: {source} {len(group):,} kept (cap {cap:,})")
+        kept.append(group)
+    df = pd.concat(kept).sort_index().reset_index(drop=True)
 
     vc = df["label"].value_counts()
     log.info(f"Label distribution: Legitimate={vc.get(0, 0)}, Malicious={vc.get(1, 0)}")
@@ -661,13 +826,14 @@ def run_pipeline(include_url_only: bool = True):
     df = pd.concat([df.reset_index(drop=True), hdr_df], axis=1)
 
     df = add_label_origin(df)
-    df = assign_splits(df)
+    df = assign_splits(df, seed=seed, cross_source=cross_source)
     df = df.drop(columns=["_body_hash"])
+    df["pipeline_version"] = PIPELINE_VERSION
 
     schema_cols = [
         "record_id", "source", "label", "label_origin", "subject", "body_text",
         "urls", "sender", "reply_to", "headers_available", "url_only",
-        *HEADER_FEATURE_NAMES, "split",
+        *HEADER_FEATURE_NAMES, "split", "pipeline_version",
     ]
     df = df[schema_cols]
 
@@ -688,9 +854,27 @@ if __name__ == "__main__":
                         help="Path for output unified CSV")
     parser.add_argument("--exclude-url-only", action="store_true",
                         help="Drop PhishTank/OpenPhish URL-only rows (kept by default)")
+    parser.add_argument("--cap", action="append", default=[], metavar="SOURCE=N",
+                        help="Row cap per source, repeatable. Defaults: enron=30000, phishtank=8000. "
+                             "Example: --cap enron=50000 --cap phishtank=0 (0 = no cap)")
+    parser.add_argument("--cross-source", type=str, default=None,
+                        help="Force the whole-source test holdout (must contain both classes)")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    caps = dict(DEFAULT_CAPS)
+    for item in args.cap:
+        name, _, value = item.partition("=")
+        if not value.isdigit():
+            parser.error(f"--cap expects SOURCE=N, got '{item}'")
+        n = int(value)
+        if n == 0:
+            caps.pop(name.strip().lower(), None)
+        else:
+            caps[name.strip().lower()] = n
 
     RAW_DIR = Path(args.raw_dir)
     OUTPUT_CSV = Path(args.output)
 
-    run_pipeline(include_url_only=not args.exclude_url_only)
+    run_pipeline(include_url_only=not args.exclude_url_only, caps=caps,
+                 cross_source=args.cross_source, seed=args.seed)
