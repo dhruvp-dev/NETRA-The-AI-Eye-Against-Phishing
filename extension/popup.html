@@ -36,33 +36,22 @@
         <span id="autofetch-btn-text">Auto-Fetch Active Email (Gmail / Outlook)</span>
       </button>
 
-      <!-- Quick Test Presets -->
-      <div class="presets-row">
-        <span class="mono-label">PRESETS:</span>
-        <button id="preset-safe" class="preset-pill" type="button">
-          <svg class="pill-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-          <span>Safe Email</span>
-        </button>
-        <button id="preset-phish" class="preset-pill" type="button">
-          <svg class="pill-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
-          <span>Urgent Phish</span>
-        </button>
-      </div>
-
       <div class="form-group">
         <label for="input-sender" class="input-label">Sender Email</label>
-        <input id="input-sender" class="text-input" type="text" placeholder="e.g. security@paypal-verify.tk" />
+        <input id="input-sender" class="text-input" type="text" placeholder="name@example.com" />
       </div>
 
       <div class="form-group">
         <label for="input-subject" class="input-label">Subject</label>
-        <input id="input-subject" class="text-input" type="text" placeholder="e.g. URGENT: Unauthorized login detected!" />
+        <input id="input-subject" class="text-input" type="text" placeholder="Subject line of the email" />
       </div>
 
       <div class="form-group">
         <label for="input-body" class="input-label">Body Text / Links</label>
-        <textarea id="input-body" class="text-area" rows="4" placeholder="Paste email content or suspicious message here..."></textarea>
+        <textarea id="input-body" class="text-area" rows="4" placeholder="Paste the message text here, or use Auto-Fetch above"></textarea>
       </div>
+
+      <span id="header-status" class="explain-note"></span>
 
       <button id="btn-scan-email" class="btn-primary-action" type="button">
         Analyze Email
@@ -178,6 +167,22 @@
           </span>
         </div>
       </div>
+    </section>
+
+    <!-- Trusted domains (extension display rule). Hidden from users on purpose; the rule still uses the lists. -->
+    <section class="card trusted-card" hidden>
+      <span class="mono-label">TRUSTED DOMAINS</span>
+      <p class="trusted-help">Mail from these senders or @domains, linking only to trusted domains, is shown as LEGITIMATE when it passes sender checks.</p>
+      <ul id="trusted-list" class="trusted-list"></ul>
+      <div class="trusted-add-row">
+        <input id="trusted-input" class="text-input" type="text" placeholder="example.edu" />
+        <button id="trusted-add" class="preset-pill" type="button">Add</button>
+      </div>
+      <div class="trusted-add-row">
+        <input id="trusted-sender-input" class="text-input" type="text" placeholder="name@example.edu" />
+        <button id="trusted-sender-add" class="preset-pill" type="button">Add</button>
+      </div>
+      <span id="trusted-note" class="explain-note"></span>
     </section>
 
     <!-- Footer Note -->

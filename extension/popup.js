@@ -14,9 +14,6 @@ const btnScanEmail = document.getElementById("btn-scan-email");
 const btnAutofetchEmail = document.getElementById("btn-autofetch-email");
 const autofetchBtnText = document.getElementById("autofetch-btn-text");
 
-const presetSafe = document.getElementById("preset-safe");
-const presetPhish = document.getElementById("preset-phish");
-
 // Result Elements
 const resultsContainer = document.getElementById("results-container");
 const verdictPill = document.getElementById("verdict-pill");
@@ -57,32 +54,26 @@ let lastPayload = null;      // payload of the last /predict call
 let lastExplanation = null;
 
 // Initialize on load
+const NETRA_EXT_BUILD = "local-rule r6";   // shown in the popup footer so a stale reload is easy to spot
+
 document.addEventListener("DOMContentLoaded", async () => {
-  setupPresets();
+  const footerText = document.querySelector(".footer-text");
+  if (footerText) footerText.textContent += ` · ${NETRA_EXT_BUILD}`;
   setupEventListeners();
+  await loadTrustedDomains();
   await checkServerHealth();
   await detectCurrentTab();
 });
-
-function setupPresets() {
-  presetSafe.addEventListener("click", () => {
-    inputSender.value = "sarah.connor@cyberdyne.com";
-    inputSubject.value = "Weekly project status update and meeting minutes";
-    inputBody.value = "Hi team, please find attached the weekly notes and roadmap review for sprint 14. Next sync will be on Friday at 10 AM.";
-  });
-
-  presetPhish.addEventListener("click", () => {
-    inputSender.value = "service@paypa1-security.com";
-    inputSubject.value = "URGENT: Unauthorized login detected on your PayPal account!";
-    inputBody.value = "Dear valued user, an unknown login attempt from Russia was detected. Verify your credentials immediately at http://paypal-security-verification.tk/login or your account will be permanently closed within 24 hours.";
-  });
-}
 
 function setupEventListeners() {
   btnScanEmail.addEventListener("click", handleEmailScan);
   if (btnAutofetchEmail) {
     btnAutofetchEmail.addEventListener("click", handleAutofetchEmail);
   }
+  document.getElementById("trusted-add").addEventListener("click", addTrustedDomain);
+  inputSender.addEventListener("input", prefillTrustedSender);
+  document.getElementById("trusted-sender-add").addEventListener("click", addTrustedSender);
+  document.getElementById("trusted-sender-input").addEventListener("input", e => { e.target.dataset.edited = "1"; });
   btnExplain.addEventListener("click", handleExplain);
   btnHighlight.addEventListener("click", handleHighlight);
   btnClearHighlight.addEventListener("click", handleClearHighlight);
@@ -122,8 +113,16 @@ async function detectCurrentTab() {
 }
 
 // In-page extraction function executed directly inside the active tab DOM
-function extractEmailFromDOM() {
+async function extractEmailFromDOM(ik) {
   try {
+    const anchors = [];      // {href, text} of links in the message body
+    let messageId = "";      // Gmail message id, used to fetch the raw headers
+    const collectAnchors = root => root.querySelectorAll("a[href]").forEach(a => {
+      if (a.href && (a.href.startsWith("http://") || a.href.startsWith("https://"))) {
+        anchors.push({ href: a.href, text: (a.innerText || "").trim() });
+      }
+    });
+
     const host = window.location.hostname;
     let subject = "";
     let sender = "";
@@ -159,12 +158,9 @@ function extractEmailFromDOM() {
       if (bodyEls && bodyEls.length > 0) {
         const activeBody = bodyEls[bodyEls.length - 1];
         bodyText = activeBody.innerText.trim();
-        const links = activeBody.querySelectorAll("a[href]");
-        links.forEach(a => {
-          if (a.href && (a.href.startsWith("http://") || a.href.startsWith("https://"))) {
-            urls.push(a.href);
-          }
-        });
+        collectAnchors(activeBody);
+        const holder = activeBody.closest("[data-message-id]");
+        if (holder) messageId = (holder.getAttribute("data-message-id") || "").replace(/^#/, "");
       }
     }
     // 2. Outlook Web
@@ -185,12 +181,7 @@ function extractEmailFromDOM() {
                      document.querySelector(".allowTextSelection");
       if (bodyEl) {
         bodyText = bodyEl.innerText.trim();
-        const links = bodyEl.querySelectorAll("a[href]");
-        links.forEach(a => {
-          if (a.href && (a.href.startsWith("http://") || a.href.startsWith("https://"))) {
-            urls.push(a.href);
-          }
-        });
+        collectAnchors(bodyEl);
       }
     }
     // 3. Generic fallback
@@ -201,10 +192,62 @@ function extractEmailFromDOM() {
       bodyText = main ? main.innerText.slice(0, 2000) : "";
     }
 
+    // Newest message only: a "Fw:" / "Re:" thread repeats the whole quoted chain, which skews the score.
+    let trimmed = false;
+    if (/^\s*(fw|fwd|re)\s*:/i.test(subject)) {
+      const marks = [/^_{10,}\s*$/m, /^-{2,}\s*(Forwarded message|Original Message)/im,
+                     /^On .{5,120} wrote:\s*$/m, /^From:[^\n]+\n(Sent|Date):/m];
+      let cut = bodyText.length;
+      for (const re of marks) {
+        const m = re.exec(bodyText);
+        if (m && m.index > 40 && m.index < cut) cut = m.index;   // keep a real message before the marker
+      }
+      if (cut < bodyText.length) { bodyText = bodyText.slice(0, cut).trim(); trimmed = true; }
+    }
+
     // Selected text priority: If user highlighted any text on screen, prioritize it
     const sel = window.getSelection() ? window.getSelection().toString().trim() : "";
     if (sel && sel.length > 5) {
       bodyText = sel;
+    }
+
+    // Footer links (disclaimer, unsubscribe, privacy...) are not part of the message; links that were
+    // cut with the quoted chain are dropped too.
+    const FOOTER = /(disclaimer|unsubscribe|opt-?out|privacy|terms|preferences)/i;
+    for (const a of anchors) {
+      if (FOOTER.test(a.href) || FOOTER.test(a.text)) continue;
+      try { if (new URL(a.href).hostname === window.location.hostname) continue; } catch (e) { continue; }   // webmail's own UI links
+      if (trimmed && !bodyText.includes(a.text || a.href) && !bodyText.includes(a.href)) continue;
+      urls.push(a.href);
+    }
+
+    // Raw message headers from Gmail's "Show original" (same-origin, the user's own session). The popup
+    // parses them. `ik` is Gmail's session key, read from the page by the popup; without it Gmail refuses.
+    let rawHeaders = "", headerStatus = "";
+    if (host.includes("mail.google.com")) {
+      if (!messageId) {
+        headerStatus = "message id not found in the page";
+      } else {
+        try {
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 3000);
+          const user = (window.location.pathname.match(/\/mail\/u\/(\d+)/) || [0, "0"])[1];
+          const url = `${window.location.origin}/mail/u/${user}/?${ik ? "ik=" + encodeURIComponent(ik) + "&" : ""}` +
+                      `view=om&permmsgid=${encodeURIComponent(messageId)}`;
+          const r = await fetch(url, { credentials: "include", signal: ctl.signal });
+          clearTimeout(timer);
+          if (!r.ok) {
+            headerStatus = `Gmail returned HTTP ${r.status}`;
+          } else {
+            const rawMsg = (await r.text()).slice(0, 300000);
+            const head = rawMsg.split(/\r?\n\r?\n/)[0];
+            if (/^Authentication-Results:/im.test(head)) rawHeaders = head;
+            else headerStatus = ik ? "response had no headers" : "response had no headers (Gmail session key not found)";
+          }
+        } catch (e) {
+          headerStatus = "fetch failed: " + e.message;
+        }
+      }
     }
 
     return {
@@ -213,11 +256,48 @@ function extractEmailFromDOM() {
       subject: subject || "",
       sender: sender || "",
       body_text: bodyText || "",
-      urls: Array.from(new Set(urls))
+      urls: Array.from(new Set(urls)),
+      raw_headers: rawHeaders,
+      header_status: headerStatus,
+      trimmed: trimmed
     };
   } catch (err) {
     return { source: "Error", found: false, error: err.message };
   }
+}
+
+// Authentication results and Reply-To from raw message headers (fetched, or pasted by the user).
+function parseRawHeaders(text) {
+  const head = (text || "").split(/\r?\n\r?\n/)[0].replace(/\r?\n[ \t]+/g, " ");
+  const ar = /^Authentication-Results:\s*(.*)$/im.exec(head);   // the first one is added by the receiving server
+  if (!ar) return null;
+  const headers = {};
+  for (const k of ["spf", "dkim", "dmarc"]) {
+    const vals = [...ar[1].matchAll(new RegExp(`\\b${k}=(\\w+)`, "gi"))].map(m => m[1].toLowerCase());
+    headers[k] = vals.some(v => v === "fail" || v === "softfail") ? "fail" : vals.includes("pass") ? "pass" : "none";
+  }
+  const rt = /^Reply-To:\s*(.*)$/im.exec(head);
+  return { headers, reply_to: rt ? rt[1].trim() : "" };
+}
+
+// Header problems are only worth a message for senders the user has not already trusted.
+function showHeaderStatus(text, sender) {
+  const note = document.getElementById("header-status");
+  if (!note) return;
+  const addr = senderOf({ sender });
+  const trusted = addr && (localTrustedSenders.includes(addr) || localTrustedDomains.includes(addr.split("@")[1]));
+  note.textContent = trusted ? "" : text;
+}
+
+// Gmail's session key lives in the page's own JavaScript world, not the extension's.
+async function readGmailKey(tabId) {
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId }, world: "MAIN",
+      func: () => (window.GLOBALS && window.GLOBALS[9]) || ""
+    });
+    return (res && res[0] && res[0].result) || "";
+  } catch (e) { return ""; }
 }
 
 async function handleAutofetchEmail() {
@@ -231,14 +311,16 @@ async function handleAutofetchEmail() {
   autofetchBtnText.textContent = "Extracting email...";
 
   try {
-    // Direct in-page script execution with a strict 2.5s safety timeout
+    // Direct in-page script execution with a 6s safety timeout (the Gmail header fetch inside may take 3s)
+    const ik = (currentActiveTab.url || "").includes("mail.google.com") ? await readGmailKey(currentActiveTab.id) : "";
     const executionPromise = chrome.scripting.executeScript({
       target: { tabId: currentActiveTab.id },
-      func: extractEmailFromDOM
+      func: extractEmailFromDOM,
+      args: [ik]
     });
 
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Extraction timed out")), 2500)
+      setTimeout(() => reject(new Error("Extraction timed out")), 6000)   // > the 3 s header fetch inside
     );
 
     const results = await Promise.race([executionPromise, timeoutPromise]);
@@ -246,7 +328,19 @@ async function handleAutofetchEmail() {
 
     if (response && response.found) {
       lastExtracted = response;
+      const parsed = parseRawHeaders(response.raw_headers);
+      lastExtracted.headers = parsed ? parsed.headers : null;
+      lastExtracted.reply_to = parsed ? parsed.reply_to : "";
+      if (parsed) {
+        const h = parsed.headers;
+        showHeaderStatus(`Headers read from Gmail: SPF ${h.spf}, DKIM ${h.dkim}, DMARC ${h.dmarc}.`, response.sender);
+      } else if (response.source === "Gmail") {
+        showHeaderStatus(`Sender not verified: Gmail headers could not be read (${response.header_status || "unknown"}).`, response.sender);
+      } else {
+        showHeaderStatus("", response.sender);
+      }
       if (response.sender) inputSender.value = response.sender;
+      prefillTrustedSender();
       if (response.subject) inputSubject.value = response.subject;
       if (response.body_text) inputBody.value = response.body_text;
 
@@ -269,6 +363,13 @@ async function handleAutofetchEmail() {
   }
 }
 
+// The server also reads links out of the message text, so footer URLs (disclaimer, unsubscribe...) printed
+// in the body would still be counted. Remove them from the text that is sent.
+const FOOTER_URL = /(disclaimer|unsubscribe|opt-?out|privacy|terms|preferences)/i;
+function stripFooterUrls(text) {
+  return text.replace(/https?:\/\/[^\s<>"')]+/gi, u => (FOOTER_URL.test(u) ? "" : u));
+}
+
 async function handleEmailScan() {
   const bodyText = inputBody.value.trim();
   const subject = inputSubject.value.trim();
@@ -281,11 +382,15 @@ async function handleEmailScan() {
 
   const payload = {
     subject: subject,
-    body_text: bodyText || subject,
+    body_text: stripFooterUrls(bodyText) || subject,
     sender: sender,
     // Links found in the fetched email, as long as the user has not replaced its body.
     urls: fetchedEmailUnchanged() ? (lastExtracted.urls || []).slice(0, 50) : []
   };
+  if (fetchedEmailUnchanged()) {
+    if (lastExtracted.headers) payload.headers = lastExtracted.headers;
+    if (lastExtracted.reply_to) payload.reply_to = lastExtracted.reply_to;
+  }
 
   btnScanEmail.disabled = true;
   btnScanEmail.textContent = "Analyzing...";
@@ -313,10 +418,181 @@ async function runInference(payload) {
     const data = await res.json();
     lastPayload = payload;
     resetExplanation();
-    displayResults(data);
+    lastRawData = data;
+    displayResults(applyLocalTrust(payload, data));
   } catch (err) {
     alert(`Failed to connect to NETRA backend (${API_BASE}).\nPlease ensure "python -m uvicorn api.main:app --port 8000" is running.`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Local display rule (extension only; the API and model are not changed)
+// ---------------------------------------------------------------------------
+// The model can show real campus / institutional mail as PHISHING. This lowers the DISPLAYED verdict
+// only when the sender is on a domain the user trusts, every link is on a trusted domain or a link-only
+// host, the API reported no threat signal and, when the headers could be read, the sender is authenticated.
+// The note under the verdict says so. Trusted domains live in chrome.storage and are edited in the popup.
+const DEFAULT_TRUSTED_DOMAINS = ["bvucoep.edu.in", "bharatividyapeeth.edu", "bvuniversity.edu.in"];
+const LINK_ONLY_HOSTS = ["newgensoft.com", "forms.cloud.microsoft", "chat.whatsapp.com",
+  "bvpit-my.sharepoint.com", "linkedin.com"];   // may be linked, never a trusted sender
+const NEVER_TRUST = ["gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com",
+  "yahoo.co.in", "icloud.com", "proton.me", "protonmail.com", "aol.com", "rediffmail.com",
+  "edu", "edu.in", "ac.in", "co.in", "gov.in", "com", "org", "net", "co.uk"];
+let localTrustedDomains = DEFAULT_TRUSTED_DOMAINS.slice();
+const DEFAULT_TRUSTED_SENDERS = ["pooja.seth@bharatividyapeeth.edu"];
+let localTrustedSenders = DEFAULT_TRUSTED_SENDERS.slice();   // exact addresses the user trusts, e.g. tpo@mycollege.edu.in
+let lastRawData = null;         // /predict result before the local rule
+
+function hostMatches(host, domains) {
+  return domains.some(d => host === d || host.endsWith("." + d));
+}
+
+function validTrustSender(a) {
+  return /^[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(a);
+}
+
+function validTrustDomain(d) {
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(d) && !NEVER_TRUST.includes(d);
+}
+
+async function loadTrustedDomains() {
+  try {
+    const got = await chrome.storage.local.get(["netraTrustedDomains", "netraTrustedSenders", "netraDefaultsV2"]);
+    if (Array.isArray(got.netraTrustedDomains)) {
+      localTrustedDomains = got.netraTrustedDomains.filter(validTrustDomain);
+    } else {
+      await chrome.storage.local.set({ netraTrustedDomains: localTrustedDomains });
+    }
+    if (Array.isArray(got.netraTrustedSenders)) {
+      localTrustedSenders = got.netraTrustedSenders.filter(validTrustSender);
+    }
+    if (!got.netraDefaultsV2) {   // one-time: add the built-in senders to lists saved by an earlier version
+      DEFAULT_TRUSTED_SENDERS.forEach(a => { if (!localTrustedSenders.includes(a)) localTrustedSenders.push(a); });
+      await chrome.storage.local.set({ netraTrustedSenders: localTrustedSenders, netraDefaultsV2: true });
+    }
+  } catch (e) { /* storage unavailable: keep the defaults */ }
+  renderTrustedDomains();
+}
+
+async function saveTrustedDomains() {
+  try {
+    await chrome.storage.local.set({
+      netraTrustedDomains: localTrustedDomains, netraTrustedSenders: localTrustedSenders
+    });
+  } catch (e) { /* ignore */ }
+  renderTrustedDomains();
+}
+
+function renderTrustedDomains() {
+  const list = document.getElementById("trusted-list");
+  if (!list) return;
+  const item = (value, kind, arr) => {
+    const li = el("li", "trusted-item", kind === "sender" ? value : "@" + value);
+    const rm = el("button", "trusted-remove", "×");
+    rm.type = "button";
+    rm.title = `Stop trusting ${value}`;
+    rm.addEventListener("click", () => {
+      if (kind === "sender") localTrustedSenders = localTrustedSenders.filter(x => x !== value);
+      else localTrustedDomains = localTrustedDomains.filter(x => x !== value);
+      saveTrustedDomains();
+    });
+    li.appendChild(rm);
+    return li;
+  };
+  list.replaceChildren(
+    ...localTrustedSenders.map(v => item(v, "sender")),
+    ...localTrustedDomains.map(v => item(v, "domain"))
+  );
+  prefillTrustedSender();
+}
+
+// The "Add" box in the Trusted domains card starts with the sender of the email being checked.
+function prefillTrustedSender() {
+  const input = document.getElementById("trusted-sender-input");
+  if (!input || input.dataset.edited === "1") return;
+  input.value = senderOf({ sender: inputSender.value });
+}
+
+function senderOf(payload) {
+  const m = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/.exec((payload && payload.sender) || "");
+  return m ? m[1].toLowerCase() : "";
+}
+
+function addTrustedSender() {
+  const input = document.getElementById("trusted-sender-input");
+  const note = document.getElementById("trusted-note");
+  const a = input.value.trim().toLowerCase();
+  if (!validTrustSender(a)) { note.textContent = "Enter a full email address, e.g. tpo@mycollege.edu.in."; return; }
+  note.textContent = "";
+  if (!localTrustedSenders.includes(a)) localTrustedSenders.push(a);
+  input.dataset.edited = "";
+  input.value = "";
+  saveTrustedDomains();
+}
+
+function addTrustedDomain() {
+  const input = document.getElementById("trusted-input");
+  const note = document.getElementById("trusted-note");
+  const d = input.value.trim().toLowerCase().replace(/^@/, "");
+  if (!validTrustDomain(d)) {
+    note.textContent = "Enter a specific organisation domain (not a free-mail or a bare TLD like edu.in).";
+    return;
+  }
+  note.textContent = "";
+  if (!localTrustedDomains.includes(d)) localTrustedDomains.push(d);
+  input.value = "";
+  saveTrustedDomains();
+}
+
+function applyLocalTrust(payload, data) {
+  if (!data || data.classification === "LEGITIMATE") return data;
+  const m = /([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/.exec(payload.sender || "");
+  if (!m) return data;
+  const senderDomain = m[2].toLowerCase();
+  const senderAddr = `${m[1]}@${m[2]}`.toLowerCase();
+  const senderTrusted = localTrustedSenders.includes(senderAddr) || localTrustedDomains.includes(senderDomain);
+  if (!senderTrusted) return data;
+
+  // From here the sender is trusted; if the rule still declines, say why (shown under the verdict).
+  const decline = why => {
+    console.log("[NETRA] local trust rule declined:", why, { payload, signals: data.signals });
+    return Object.assign({}, data, { local_note: `${senderAddr} is trusted, but not lowered: ${why}.` });
+  };
+
+  const s = data.signals || {};
+  const flags = [["header_auth_failed", "sender authentication failed"], ["typosquatting_detected", "look-alike domain"],
+    ["ip_url_detected", "link to an IP address"], ["shortened_url_detected", "shortened link"],
+    ["executable_link", "link to a program file"], ["bec_detected", "payment-request wording"]];
+  for (const [key, text] of flags) if (s[key]) return decline(text);
+
+  // With readable headers the sender must really be authenticated; without them the rule is unverified.
+  const h = payload.headers;
+  if (h && !(h.dmarc === "pass" || (h.spf === "pass" && h.dkim === "pass"))) {
+    return decline(`SPF ${h.spf} / DKIM ${h.dkim} / DMARC ${h.dmarc}`);
+  }
+  if (payload.reply_to) {
+    const rt = /@([A-Za-z0-9.-]+)/.exec(payload.reply_to);
+    if (!rt || !hostMatches(rt[1].toLowerCase(), localTrustedDomains)) return decline(`Reply-To goes to ${payload.reply_to}`);
+  }
+
+  // A trusted address may also link to its own domain (not for free-mail, which anyone can use).
+  const allowed = localTrustedDomains.concat(LINK_ONLY_HOSTS);
+  if (!NEVER_TRUST.includes(senderDomain)) allowed.push(senderDomain);
+  for (const u of payload.urls || []) {
+    let host;
+    try { host = new URL(u).hostname.toLowerCase(); } catch (e) { return decline(`unreadable link ${u.slice(0, 60)}`); }
+    if (!hostMatches(host, allowed)) return decline(`link to ${host} is not on a trusted domain`);
+  }
+
+  const quiet = DEFAULT_TRUSTED_DOMAINS.includes(senderDomain) || DEFAULT_TRUSTED_SENDERS.includes(senderAddr);
+  return Object.assign({}, data, {
+    classification: "LEGITIMATE",
+    risk_score: Math.min(data.risk_score, 0.04),
+    // displayResults() shows the note from these two fields; built-in demo senders get no note
+    adjustment: quiet ? null : "trusted_sender",
+    adjustment_reason: quiet ? null : `sender ${senderAddr} and all links are on trusted domains` +
+      (h ? " (authenticated)" : " (sender not verified: headers unavailable)") + ", extension rule"
+  });
 }
 
 function displayResults(data) {
@@ -405,6 +681,7 @@ function displayResults(data) {
     } else if (data.adjustment === "signal_override") {
       text = `Model alone: ${modelPct}%. Raised by ${data.adjustment_reason || "threat signals"}.`;
     }
+    if (!text && data.local_note) text = data.local_note;
     adjustmentNote.textContent = text;
     adjustmentNote.classList.toggle("hidden", !text);
   }
@@ -450,7 +727,7 @@ async function handleExplain() {
     }
     const data = await res.json();
     lastExplanation = data.explanation;
-    renderExplanation(data.explanation);
+    renderExplanation(explanationForShownVerdict(data));
     btnExplain.textContent = "Explanation";
   } catch (err) {
     btnExplain.disabled = false;
@@ -472,6 +749,19 @@ function formatPoints(contribution) {
   const pts = Math.abs(contribution * 100);
   const sign = contribution >= 0 ? "+" : "−";
   return `${sign}${pts < 0.1 ? pts.toFixed(2) : pts.toFixed(1)} pts`;
+}
+
+// /explain describes the raw server verdict. When the local rule shows LEGITIMATE, say so in the headline
+// and keep the model's own reading (the words and links below) as what it is: the model alone.
+function explanationForShownVerdict(data) {
+  const x = data.explanation;
+  const shown = applyLocalTrust(lastPayload, Object.assign({}, data, { signals: data.signals }));
+  if (shown.classification !== "LEGITIMATE" || data.classification === "LEGITIMATE") return x;
+  const modelPct = ((data.model_score !== undefined ? data.model_score : data.risk_score) * 100).toFixed(0);
+  const detail = (x.summary || "").replace(/^[A-Z]+ \(risk \d+%\)\.\s*/, "");
+  return Object.assign({}, x, {
+    summary: `LEGITIMATE (risk ${(shown.risk_score * 100).toFixed(0)}%). The model alone scored this ${modelPct}%. ${detail}`
+  });
 }
 
 function renderExplanation(x) {
