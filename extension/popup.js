@@ -70,10 +70,17 @@ function setupEventListeners() {
   if (btnAutofetchEmail) {
     btnAutofetchEmail.addEventListener("click", handleAutofetchEmail);
   }
-  document.getElementById("trusted-add").addEventListener("click", addTrustedDomain);
   inputSender.addEventListener("input", prefillTrustedSender);
   document.getElementById("trusted-sender-add").addEventListener("click", addTrustedSender);
-  document.getElementById("trusted-sender-input").addEventListener("input", e => { e.target.dataset.edited = "1"; });
+  const helpBtn = document.getElementById("trusted-help-btn");
+  helpBtn.addEventListener("click", () => {
+    const box = document.getElementById("trusted-help");
+    box.hidden = !box.hidden;
+    helpBtn.setAttribute("aria-expanded", String(!box.hidden));
+  });
+  const trustedInput = document.getElementById("trusted-sender-input");
+  trustedInput.addEventListener("input", e => { e.target.dataset.edited = "1"; setTrustedNote(""); });
+  trustedInput.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); addTrustedSender(); } });
   btnExplain.addEventListener("click", handleExplain);
   btnHighlight.addEventListener("click", handleHighlight);
   btnClearHighlight.addEventListener("click", handleClearHighlight);
@@ -129,6 +136,7 @@ async function extractEmailFromDOM(ik) {
     let bodyText = "";
     const urls = [];
     let source = "Webpage";
+    let senderName = "";
 
     // 1. Gmail
     if (host.includes("mail.google.com")) {
@@ -151,6 +159,7 @@ async function extractEmailFromDOM(ik) {
                        document.querySelector(".go");
       if (senderEl) {
         sender = senderEl.getAttribute("email") || senderEl.innerText.trim();
+        senderName = (senderEl.getAttribute("name") || (senderEl.getAttribute("email") ? senderEl.innerText : "")).trim();
       }
 
       // Body: .a3s is standard for message body
@@ -255,6 +264,7 @@ async function extractEmailFromDOM(ik) {
       found: Boolean(subject || bodyText || sender),
       subject: subject || "",
       sender: sender || "",
+      sender_name: senderName,
       body_text: bodyText || "",
       urls: Array.from(new Set(urls)),
       raw_headers: rawHeaders,
@@ -484,33 +494,49 @@ async function saveTrustedDomains() {
 }
 
 function renderTrustedDomains() {
-  const list = document.getElementById("trusted-list");
-  if (!list) return;
-  const item = (value, kind, arr) => {
-    const li = el("li", "trusted-item", kind === "sender" ? value : "@" + value);
-    const rm = el("button", "trusted-remove", "×");
-    rm.type = "button";
-    rm.title = `Stop trusting ${value}`;
-    rm.addEventListener("click", () => {
-      if (kind === "sender") localTrustedSenders = localTrustedSenders.filter(x => x !== value);
-      else localTrustedDomains = localTrustedDomains.filter(x => x !== value);
-      saveTrustedDomains();
-    });
-    li.appendChild(rm);
-    return li;
-  };
-  list.replaceChildren(
-    ...localTrustedSenders.map(v => item(v, "sender")),
-    ...localTrustedDomains.map(v => item(v, "domain"))
-  );
   prefillTrustedSender();
 }
 
-// The "Add" box in the Trusted domains card starts with the sender of the email being checked.
+let trustedNoteTimer = null;
+function setTrustedNote(text, kind) {
+  const note = document.getElementById("trusted-note");
+  if (!note) return;
+  clearTimeout(trustedNoteTimer);
+  note.textContent = text;
+  note.className = "trusted-note" + (kind ? " " + kind : "");
+  if (kind === "ok") trustedNoteTimer = setTimeout(() => setTrustedNote(""), 5000);
+}
+
+// A change to the trusted list applies to the result already on screen.
+function refreshShownVerdict() {
+  if (lastRawData && lastPayload) displayResults(applyLocalTrust(lastPayload, lastRawData));
+}
+
+// Display name of the sender, from the fetched email or a typed "Name <address>".
+function senderNameOf(address) {
+  if (lastExtracted && lastExtracted.sender_name && senderOf(lastExtracted) === address) {
+    return lastExtracted.sender_name;
+  }
+  const m = /^\s*"?([^"<@]+?)"?\s*<[^>]+>/.exec(inputSender.value || "");
+  return m ? m[1].trim() : "";
+}
+
+// The "Add" box in the Trusted senders card starts with the sender of the email being checked.
 function prefillTrustedSender() {
   const input = document.getElementById("trusted-sender-input");
-  if (!input || input.dataset.edited === "1") return;
-  input.value = senderOf({ sender: inputSender.value });
+  const from = document.getElementById("trusted-from");
+  if (!input) return;
+  const addr = senderOf({ sender: inputSender.value });
+  if (input.dataset.edited !== "1") input.value = addr;
+  if (from) {
+    const name = addr ? senderNameOf(addr) : "";
+    const trusted = addr && (localTrustedSenders.includes(addr) ||
+      localTrustedDomains.includes(addr.split("@")[1]));
+    from.hidden = !addr;
+    from.textContent = addr
+      ? `Open email from ${name ? name + " (" + addr + ")" : addr}${trusted ? " is already trusted" : ""}`
+      : "";
+  }
 }
 
 function senderOf(payload) {
@@ -520,28 +546,19 @@ function senderOf(payload) {
 
 function addTrustedSender() {
   const input = document.getElementById("trusted-sender-input");
-  const note = document.getElementById("trusted-note");
-  const a = input.value.trim().toLowerCase();
-  if (!validTrustSender(a)) { note.textContent = "Enter a full email address, e.g. tpo@mycollege.edu.in."; return; }
-  note.textContent = "";
-  if (!localTrustedSenders.includes(a)) localTrustedSenders.push(a);
+  const addr = input.value.trim().toLowerCase();
+  if (!addr) { setTrustedNote("Enter an email address first.", "error"); return; }
+  if (!validTrustSender(addr)) { setTrustedNote("That doesn't look like a full email address, like name@example.edu.", "error"); return; }
+  if (localTrustedSenders.includes(addr)) { setTrustedNote(`${addr} is already a trusted sender.`, "error"); return; }
+  const name = senderNameOf(addr);
+  localTrustedSenders.push(addr);
   input.dataset.edited = "";
-  input.value = "";
   saveTrustedDomains();
-}
-
-function addTrustedDomain() {
-  const input = document.getElementById("trusted-input");
-  const note = document.getElementById("trusted-note");
-  const d = input.value.trim().toLowerCase().replace(/^@/, "");
-  if (!validTrustDomain(d)) {
-    note.textContent = "Enter a specific organisation domain (not a free-mail or a bare TLD like edu.in).";
-    return;
-  }
-  note.textContent = "";
-  if (!localTrustedDomains.includes(d)) localTrustedDomains.push(d);
-  input.value = "";
-  saveTrustedDomains();
+  refreshShownVerdict();
+  setTrustedNote(`${name ? name + " (" + addr + ")" : addr} is now a trusted sender.`, "ok");
+  const btn = document.getElementById("trusted-sender-add");
+  btn.classList.add("added");
+  setTimeout(() => btn.classList.remove("added"), 1500);
 }
 
 function applyLocalTrust(payload, data) {
@@ -553,45 +570,12 @@ function applyLocalTrust(payload, data) {
   const senderTrusted = localTrustedSenders.includes(senderAddr) || localTrustedDomains.includes(senderDomain);
   if (!senderTrusted) return data;
 
-  // From here the sender is trusted; if the rule still declines, say why (shown under the verdict).
-  const decline = why => {
-    console.log("[NETRA] local trust rule declined:", why, { payload, signals: data.signals });
-    return Object.assign({}, data, { local_note: `${senderAddr} is trusted, but not lowered: ${why}.` });
-  };
-
-  const s = data.signals || {};
-  const flags = [["header_auth_failed", "sender authentication failed"], ["typosquatting_detected", "look-alike domain"],
-    ["ip_url_detected", "link to an IP address"], ["shortened_url_detected", "shortened link"],
-    ["executable_link", "link to a program file"], ["bec_detected", "payment-request wording"]];
-  for (const [key, text] of flags) if (s[key]) return decline(text);
-
-  // With readable headers the sender must really be authenticated; without them the rule is unverified.
-  const h = payload.headers;
-  if (h && !(h.dmarc === "pass" || (h.spf === "pass" && h.dkim === "pass"))) {
-    return decline(`SPF ${h.spf} / DKIM ${h.dkim} / DMARC ${h.dmarc}`);
-  }
-  if (payload.reply_to) {
-    const rt = /@([A-Za-z0-9.-]+)/.exec(payload.reply_to);
-    if (!rt || !hostMatches(rt[1].toLowerCase(), localTrustedDomains)) return decline(`Reply-To goes to ${payload.reply_to}`);
-  }
-
-  // A trusted address may also link to its own domain (not for free-mail, which anyone can use).
-  const allowed = localTrustedDomains.concat(LINK_ONLY_HOSTS);
-  if (!NEVER_TRUST.includes(senderDomain)) allowed.push(senderDomain);
-  for (const u of payload.urls || []) {
-    let host;
-    try { host = new URL(u).hostname.toLowerCase(); } catch (e) { return decline(`unreadable link ${u.slice(0, 60)}`); }
-    if (!hostMatches(host, allowed)) return decline(`link to ${host} is not on a trusted domain`);
-  }
-
-  const quiet = DEFAULT_TRUSTED_DOMAINS.includes(senderDomain) || DEFAULT_TRUSTED_SENDERS.includes(senderAddr);
+  // A trusted sender is always shown as LEGITIMATE: no link, header or signal checks, no note.
   return Object.assign({}, data, {
     classification: "LEGITIMATE",
     risk_score: Math.min(data.risk_score, 0.04),
-    // displayResults() shows the note from these two fields; built-in demo senders get no note
-    adjustment: quiet ? null : "trusted_sender",
-    adjustment_reason: quiet ? null : `sender ${senderAddr} and all links are on trusted domains` +
-      (h ? " (authenticated)" : " (sender not verified: headers unavailable)") + ", extension rule"
+    adjustment: null,
+    adjustment_reason: null
   });
 }
 

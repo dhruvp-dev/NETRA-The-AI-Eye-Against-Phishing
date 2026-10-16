@@ -169,20 +169,23 @@
       </div>
     </section>
 
-    <!-- Trusted domains (extension display rule). Hidden from users on purpose; the rule still uses the lists. -->
-    <section class="card trusted-card" hidden>
-      <span class="mono-label">TRUSTED DOMAINS</span>
-      <p class="trusted-help">Mail from these senders or @domains, linking only to trusted domains, is shown as LEGITIMATE when it passes sender checks.</p>
-      <ul id="trusted-list" class="trusted-list"></ul>
-      <div class="trusted-add-row">
-        <input id="trusted-input" class="text-input" type="text" placeholder="example.edu" />
-        <button id="trusted-add" class="preset-pill" type="button">Add</button>
+    <!-- Trusted senders: addresses whose mail the local rule may show as LEGITIMATE -->
+    <section class="trusted-card" aria-labelledby="trusted-title">
+      <div class="trusted-head">
+        <svg class="trusted-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path><polyline points="9 12 11 14 15 10"></polyline></svg>
+        <h2 id="trusted-title" class="trusted-title">Trusted senders</h2>
+        <button id="trusted-help-btn" class="help-btn" type="button" aria-expanded="false" aria-controls="trusted-help" aria-label="What is a trusted sender?" title="What is a trusted sender?">?</button>
       </div>
+      <p id="trusted-help" class="trusted-help" hidden>A trusted sender is an address you know and rely on. Its mail is shown as legitimate when the sender checks pass and every link points to a trusted site. A failed check or an unknown link still shows a warning.</p>
+      <div id="trusted-from" class="trusted-from" hidden></div>
       <div class="trusted-add-row">
-        <input id="trusted-sender-input" class="text-input" type="text" placeholder="name@example.edu" />
-        <button id="trusted-sender-add" class="preset-pill" type="button">Add</button>
+        <input id="trusted-sender-input" class="text-input" type="email" autocomplete="off" spellcheck="false" placeholder="name@example.edu" aria-label="Email address to trust" />
+        <button id="trusted-sender-add" class="btn-icon" type="button" aria-label="Add trusted sender" title="Add trusted sender">
+          <svg class="icon-plus" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          <svg class="icon-check" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>
+        </button>
       </div>
-      <span id="trusted-note" class="explain-note"></span>
+      <div id="trusted-note" class="trusted-note" role="status" aria-live="polite"></div>
     </section>
 
     <!-- Footer Note -->
