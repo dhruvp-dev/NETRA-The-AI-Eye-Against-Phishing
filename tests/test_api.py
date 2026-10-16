@@ -20,7 +20,9 @@ def reset_state(monkeypatch, tmp_path):
     monkeypatch.setattr(main.state, "suspicious_upper", 0.25)
     monkeypatch.setattr(main.state, "threshold_source", "test")
     monkeypatch.setattr(main.state, "inference_slots", None)
+    monkeypatch.setattr(main.state, "explain_slots", None)
     monkeypatch.setattr(main, "_limiter", SlidingWindowRateLimiter(20, 60))
+    monkeypatch.setattr(main, "_explain_limiter", SlidingWindowRateLimiter(5, 60))
     monkeypatch.setattr(main, "THRESHOLD_CONFIG_PATH", tmp_path / "threshold_config.json")
     monkeypatch.delenv("NETRA_ADMIN_TOKEN", raising=False)
     monkeypatch.delenv("NETRA_TRUSTED_PROXY_HOPS", raising=False)
@@ -316,3 +318,130 @@ def test_internal_error_message_is_generic(client, monkeypatch):
     assert r.status_code == 500
     assert r.json()["detail"] == "Prediction failed"
     assert "secret" not in r.text
+
+
+# ---------------------------------------------------------------------------
+# /explain
+# ---------------------------------------------------------------------------
+PREDICT_KEYS = {"classification", "risk_score", "confidence", "risk_level", "model_type",
+                "threshold_used", "signals", "processing_time_ms"}
+
+PHISH = {
+    "subject": "Account suspended",
+    "body_text": "URGENT: Your account is suspended. Verify immediately.",
+    "urls": ["http://paypa1-secure.example.tk/login"],
+    "sender": "security@paypa1-alert.com",
+    "headers": {"spf": "fail", "dkim": "fail", "dmarc": "fail"},
+}
+
+
+def explained_with_margin(monkeypatch, f_input: float, f_baseline: float = 0.4):
+    """DistilBERT 'loaded'; IG returns a fixed result whose margin is f_input."""
+    from ml.explain import IGResult, WordAttribution
+
+    def fake(req, urls):
+        body = req.body_text
+        words = [WordAttribution("Verify", "body", None, body.find("Verify"), body.find("Verify") + 6,
+                                 (f_input - f_baseline) * 0.7),
+                 WordAttribution("account", "body", None, body.find("account"), body.find("account") + 7,
+                                 (f_input - f_baseline) * 0.3)]
+        ig = IGResult(words=words, header=[0.0] * 10, f_input=f_input, f_baseline=f_baseline, delta=0.0,
+                      n_tokens=12, n_steps=32, truncated=False)
+        return ig, [0.0] * 10, False
+
+    monkeypatch.setattr(main.state, "db_ready", True)
+    monkeypatch.setattr(main, "_explain_distilbert", fake)
+
+
+def test_predict_response_keys_unchanged(client, monkeypatch):
+    loaded_with_score(monkeypatch, 0.6)
+    assert set(client.post("/predict", json=BENIGN).json()) == PREDICT_KEYS
+
+
+def test_explain_503_without_model(client):
+    assert client.post("/explain", json=BENIGN).status_code == 503
+
+
+def test_explain_matches_decision_and_adds_explanation(client, monkeypatch):
+    explained_with_margin(monkeypatch, 3.0)
+    r = client.post("/explain", json=PHISH)
+    assert r.status_code == 200
+    body = r.json()
+    assert PREDICT_KEYS <= set(body)
+    p = 1 / (1 + 2.718281828459045 ** -3.0)
+    assert body["classification"] == "PHISHING"
+    assert body["risk_score"] == pytest.approx(p, abs=1e-4)
+    x = body["explanation"]
+    assert x["method"] == "integrated_gradients"
+    assert x["top_phishing_tokens"][0]["text"] == "Verify"
+    tot = x["baseline_score"] + sum(f["contribution"] for f in x["threat_factors"])
+    assert tot == pytest.approx(body["risk_score"], abs=1e-3)
+    assert x["summary"].startswith("PHISHING")
+    assert x["threat_factors"][0]["label"].lower() in x["summary"]
+
+
+def test_explain_override_is_attributed_to_signals(client, monkeypatch):
+    explained_with_margin(monkeypatch, -5.0)      # model alone: LEGITIMATE
+    r = client.post("/explain", json=PHISH)
+    body = r.json()
+    assert body["classification"] == "PHISHING"   # >= 3 signals
+    x = body["explanation"]
+    assert x["override"] == "phishing_floor"
+    rule = [c for f in x["threat_factors"] for c in f["components"] if c["source"] == "rule"]
+    assert len(rule) == 4 and len({c["contribution"] for c in rule}) == 1
+
+
+def test_explain_rf_fallback_is_signals_only(client, monkeypatch):
+    monkeypatch.setattr(main.state, "rf_ready", True)
+    monkeypatch.setattr(main, "_score_rf", lambda req, urls: (0.01, 0.99))
+    r = client.post("/explain", json=PHISH)
+    x = r.json()["explanation"]
+    assert x["method"] == "signals_only"
+    assert x["top_phishing_tokens"] == [] and x["header_attributions"] == []
+
+
+def test_explain_has_its_own_rate_limit(client, monkeypatch):
+    explained_with_margin(monkeypatch, 3.0)
+    codes = [client.post("/explain", json=PHISH).status_code for _ in range(6)]
+    assert codes == [200] * 5 + [429]
+    loaded_with_score(monkeypatch, 0.6)
+    assert client.post("/predict", json=BENIGN).status_code == 200   # /predict not starved
+
+
+def test_explain_spoofed_xff_does_not_bypass_limit(client, monkeypatch):
+    explained_with_margin(monkeypatch, 3.0)
+    for i in range(5):
+        client.post("/explain", json=PHISH, headers={"X-Forwarded-For": f"10.0.0.{i}"})
+    r = client.post("/explain", json=PHISH, headers={"X-Forwarded-For": "10.0.0.99"})
+    assert r.status_code == 429
+
+
+def test_explain_top_k_validated(client, monkeypatch):
+    explained_with_margin(monkeypatch, 3.0)
+    assert client.post("/explain", json=dict(PHISH, top_k=0)).status_code == 422
+    assert client.post("/explain", json=dict(PHISH, top_k=26)).status_code == 422
+
+
+def test_explain_internal_error_is_generic(client, monkeypatch):
+    monkeypatch.setattr(main.state, "db_ready", True)
+
+    def broken(req, urls):
+        raise RuntimeError("secret internal detail")
+
+    monkeypatch.setattr(main, "_explain_distilbert", broken)
+    r = client.post("/explain", json=PHISH)
+    assert r.status_code == 500 and "secret" not in r.text
+
+
+def test_prepare_inputs_header_baseline_is_no_headers(monkeypatch):
+    monkeypatch.setattr(main.state, "db_config", {"text_format": "v3", "header_features_trained": True})
+    req = main.PredictRequest(**PHISH)
+    text, spans, hv, hb = main._prepare_distilbert_inputs(req, main.extract_urls(req.subject, req.body_text, req.urls))
+    assert text.startswith("Subject: Account suspended\nBody: ")
+    assert [s.field for s in spans] == ["subject", "body", "url"]
+    assert hb == [0, 0, 1, 0, 0, 1, 0, 0, 1, 1]
+    assert hv[1] == 1 and hv[4] == 1 and hv[7] == 1     # spf/dkim/dmarc fail
+
+    monkeypatch.setattr(main.state, "db_config", {})
+    text, spans, hv, hb = main._prepare_distilbert_inputs(req, [])
+    assert text == req.body_text and hv == hb == [0.0] * 10

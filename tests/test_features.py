@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from ml.features.header_features import extract, extract_from_row, normalize_auth, HEADER_FEATURE_NAMES
-from ml.features.text_builder import build_model_text, extract_urls, MAX_URLS
+from ml.features.text_builder import build_model_text, build_model_text_with_spans, extract_urls, MAX_URLS
 from ml.features.url_features import check_typosquatting, _subdomain_depth
 
 
@@ -90,6 +90,37 @@ def test_model_text_is_deterministic_and_dedupes_urls():
 
 def test_url_only_record_text_is_url_line_only():
     assert build_model_text("", "", ["http://evil.example.tk/a"]) == "URL: http://evil.example.tk/a"
+
+
+def _legacy_build_model_text(subject, body, urls):
+    """The pre-span implementation, kept to prove the training prompt did not change."""
+    parts = []
+    if subject and subject.strip():
+        parts.append(f"Subject: {subject.strip()}")
+    if body and body.strip():
+        parts.append(f"Body: {body.strip()}")
+    for u in dict.fromkeys(urls or []):
+        parts.append(f"URL: {u}")
+    return "\n".join(parts)
+
+
+@pytest.mark.parametrize("subject,body,urls", [
+    ("Hi", "Body text", ["https://a.example.com"]),
+    ("  padded subject  ", "\n\n  body with lead  \n", []),
+    ("", "only body", ["u1", "u1", "u2"]),
+    (None, None, ["http://evil.example.tk/a"]),
+    ("   ", "   ", []),
+    ("Subject: inside", "Body: inside\nURL: inside", ["x"]),
+])
+def test_model_text_with_spans_matches_prompt_and_offsets(subject, body, urls):
+    text, spans = build_model_text_with_spans(subject, body, urls)
+    assert text == build_model_text(subject, body, urls) == _legacy_build_model_text(subject, body, urls)
+    fields = {"subject": subject, "body": body}
+    deduped = list(dict.fromkeys(urls))
+    for sp in spans:
+        source = deduped[sp.index] if sp.field == "url" else fields[sp.field]
+        content = text[sp.start:sp.end]
+        assert source[sp.field_offset:sp.field_offset + len(content)] == content
 
 
 def test_extract_urls_order_preserving_and_capped():

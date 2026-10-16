@@ -181,6 +181,7 @@ python ml/train_distilbert.py --epochs 3 --batch_size 32 --precision bf16 --seed
 |---|---|---|
 | `GET` | `/health` | Active model status and thresholds. Returns `503` when no model is loaded. |
 | `POST` | `/predict` | Evaluates email subject, body, sender, and headers. Limited to 20 requests/minute per client. |
+| `POST` | `/explain` | Same body as `/predict` (plus optional `top_k`, 1-25). Returns the `/predict` fields and an `explanation`: words that raised and lowered the risk, header attributions, a threat-factor breakdown that adds up to the final score, and a one-line summary. Runs Integrated Gradients, so it takes seconds on CPU. Limited to 5 requests/minute per client and one explanation at a time, so it never delays `/predict`. |
 | `POST` | `/admin/recalibrate` | Live threshold update. Requires `Authorization: Bearer <NETRA_ADMIN_TOKEN>`. Returns `404` when the token is not set. |
 | `GET` | `/docs` | Interactive Swagger OpenAPI UI. |
 
@@ -191,12 +192,21 @@ python ml/train_distilbert.py --epochs 3 --batch_size 32 --precision bf16 --seed
 | `NETRA_ADMIN_TOKEN` | unset (admin endpoint disabled) | Bearer token for `/admin/recalibrate`. |
 | `NETRA_TRUSTED_PROXY_HOPS` | `0` | Reverse proxies in front of the API. Cloud Run: `1`. `0` ignores `X-Forwarded-For`. |
 | `NETRA_MAX_CONCURRENCY` | `2` | Maximum concurrent model inferences. |
+| `NETRA_XAI_STEPS` | `32` | Integrated Gradients steps for `/explain` (8-64). Fewer is faster and less exact. |
+
+**How `/explain` works**
+
+- **Model part:** Integrated Gradients on the frozen DistilBERT, over the word embeddings and the 10 header features together. The target is the phishing log-odds. Every content word is compared against a `[SEP]` token, which this checkpoint scores as neutral. Headers are compared against "no headers provided". The attributions add up to the change in the model's score (`completeness_delta` is the error).
+- **Rule part:** when the multi-signal rule raises the verdict, the uplift is split equally across the signals it counted.
+- **Combined:** both parts are reported per threat factor (wording, links, sender authentication, Reply-To), in probability points that add up to `risk_score`.
+- **Extension:** click **Why this verdict?** after a scan, then **Highlight in page** to mark the words in the open Gmail or Outlook email.
 
 **Running the tests**
 
 ```bash
 pytest tests/                                  # unit and API tests (no weights needed)
 python tests/stress_test_tier1.py              # end-to-end verdicts and latency (needs weights)
+python tests/xai_sanity.py                     # /explain faithfulness, completeness and latency (needs weights)
 ```
 
 ---
@@ -206,8 +216,10 @@ python tests/stress_test_tier1.py              # end-to-end verdicts and latency
 ```text
 NETRA/
 ├── api/
-│   └── main.py                   # FastAPI application with multi-signal fusion
+│   ├── main.py                   # FastAPI application with multi-signal fusion
+│   └── xai.py                    # /explain: factor breakdown, schemas, summary
 ├── ml/
+│   ├── explain.py                # Integrated Gradients for the Tier-1 model
 │   ├── features/
 │   │   ├── header_features.py    # SPF, DKIM, DMARC parsing
 │   │   ├── text_features.py      # Urgency keywords & lexical statistics

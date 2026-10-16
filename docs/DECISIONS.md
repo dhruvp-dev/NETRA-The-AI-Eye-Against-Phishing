@@ -115,3 +115,38 @@ The system is Tier-1 only. If escalation is reconsidered, it should start from
 a clean label source that does not depend on Tier-1 outputs.
 
 > Decisions 1-5 are kept for history only. Their Tier-2 design no longer applies.
+
+---
+
+## Decision 7: Explanations (`POST /explain`)
+
+**Date:** 2026-10-16
+**Status:** Accepted. Replaces the XAI part of Decision 4.
+
+### Context
+Verdicts come from the frozen DistilBERT score and the multi-signal override in
+`api/main.py: _decide`. An explanation has to cover both, without retraining.
+
+### Decision
+- **Integrated Gradients**, written in `ml/explain.py` without Captum (no new pinned
+  dependency). One straight path over word embeddings and the 10 header features, so a
+  single completeness check covers both inputs. Target: logit margin.
+- **Not chosen:**
+  - SHAP Partition needs hundreds of forward passes for 256 tokens and has no joint text and tabular masker.
+  - LIME is unstable between runs.
+  - Raw attention and attention rollout are not faithful, and they cannot see the header branch.
+- **Text baseline: `[SEP]`.** Content tokens are replaced and the scaffolding is kept. Measured on
+  this checkpoint, `[PAD]`, `[MASK]`, `[UNK]`, zero and mean embeddings all score F ≈ 4-9 (phishing),
+  which pushes the credit onto stopwords. `[SEP]` scores F ≈ 0.3-0.5 on both phishing and legitimate
+  emails.
+- **Header baseline:** "no headers provided" (`*_none = 1`, match = 1). An all-zero vector is
+  impossible for one-hots.
+- **Adaptive steps.** Along the path, F is flat and then jumps by about 10 logits within about 5% of
+  it. Uniform and Gauss-Legendre nodes miss the jump (completeness error 60-160%). A refined
+  forward-only scan places the gradient nodes where F changes. The completeness error falls to
+  about 2-6% at 32 steps.
+- **Rule override:** the uplift is split equally across the counted signal units. The override is a
+  threshold on a count of interchangeable units, so this is their exact Shapley value.
+- **On demand only.** About 2-4 s for a short email and about 7-15 s at 256 tokens on a laptop CPU.
+  `/explain` has its own rate limit (5/min) and a single inference slot, so `/predict` latency is
+  unaffected.

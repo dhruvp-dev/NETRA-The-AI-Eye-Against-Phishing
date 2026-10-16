@@ -148,6 +148,26 @@
           </div>
         </div>
 
+        <!-- Explanation (on demand: POST /explain) -->
+        <button id="btn-explain" class="btn-secondary-action" type="button">Why this verdict?</button>
+        <div id="explain-container" class="explain-section hidden">
+          <span class="mono-label">THREAT FACTOR BREAKDOWN</span>
+          <p id="explain-summary" class="explain-summary"></p>
+          <div id="factor-bar" class="factor-bar" role="img" aria-label="Share of risk per factor"></div>
+          <ul id="factor-list" class="factor-list"></ul>
+
+          <span class="mono-label">WORDS THAT RAISED RISK</span>
+          <div id="tokens-phish" class="token-chips"></div>
+          <span class="mono-label">WORDS THAT LOWERED RISK</span>
+          <div id="tokens-legit" class="token-chips"></div>
+
+          <div class="explain-actions">
+            <button id="btn-highlight" class="preset-pill" type="button" disabled>Highlight in page</button>
+            <button id="btn-clear-highlight" class="preset-pill" type="button" disabled>Clear highlights</button>
+          </div>
+          <span id="explain-note" class="explain-note"></span>
+        </div>
+
         <!-- Meta Footer -->
         <div class="meta-footer">
           <span class="meta-badge">Inference Latency</span>
