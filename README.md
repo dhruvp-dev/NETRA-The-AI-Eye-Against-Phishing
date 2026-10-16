@@ -168,7 +168,9 @@ curl.exe -X POST "http://localhost:8000/predict" `
 ### Option B: Local NVIDIA GPU (RTX 3050 / RTX 40-series)
 If you have a dedicated NVIDIA GPU:
 ```bash
-python ml/train_distilbert.py --epochs 3 --batch_size 16 --fp16
+python ml/train_distilbert.py --epochs 3 --batch_size 32 --precision bf16 --seed 42
+# Out of memory? --batch_size 16 --grad_accum 2
+# Or run the step-by-step notebook: notebooks/NETRA_DistilBERT_Training_Local.ipynb (includes checks, backup and the stress gate)
 ```
 
 ---

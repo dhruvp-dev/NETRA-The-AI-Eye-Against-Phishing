@@ -72,8 +72,10 @@ python tests/stress_test_tier1.py               # end-to-end verdicts + latency;
 # 1. Build unified.csv from data/raw/ (URL-only rows are kept by default)
 python ml/data_pipeline.py [--raw-dir ...] [--output ...] [--exclude-url-only]
 
-# 2. Train DistilBERT (GPU recommended; --fp16 applies on CUDA only)
-python ml/train_distilbert.py --epochs 3 --batch_size 16 --lr 2e-5 --max_length 256 --seed 42 --fp16
+# 2. Train DistilBERT (GPU recommended). bf16 is chosen automatically on Ampere+ GPUs (RTX 3060).
+#    Out of memory? use --batch_size 16 --grad_accum 2 (same effective batch of 32).
+#    --output_dir writes elsewhere (e.g. ml/models/_smoke for smoke runs). --max_train_rows is for smoke runs only.
+python ml/train_distilbert.py --epochs 3 --batch_size 32 --grad_accum 1 --lr 2e-5 --max_length 256 --seed 42 --precision bf16 --patience 1
 
 # 3. Calibrate thresholds on VALIDATION probabilities of the served model
 python ml/calibrate_threshold.py                # DistilBERT → threshold_config.json

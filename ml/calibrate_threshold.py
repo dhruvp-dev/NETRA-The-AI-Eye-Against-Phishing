@@ -120,32 +120,42 @@ def merge_write(path: Path, updates: dict) -> dict:
 # ---------------------------------------------------------------------------
 # DistilBERT (served model)
 # ---------------------------------------------------------------------------
-def val_probs_distilbert(data_path: Path):
+def val_probs_distilbert(data_path: Path, models_dir: Path, include_url_only: bool = False):
+    """
+    Score the validation split with the model in models_dir. URL-only rows are excluded by
+    default: the API only sees emails, so thresholds must be set on emails.
+    """
     import torch
     from transformers import AutoTokenizer
     from ml.distilbert_model import PhishingClassifier
     from ml.train_distilbert import (EncodedEmails, encode, load_split_frame,
                                      make_loader, pick_device, predict_probs)
 
-    cfg = json.loads(DISTILBERT_CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg = json.loads((models_dir / "distilbert_config.json").read_text(encoding="utf-8"))
     max_len = int(cfg.get("max_length", 256))
     device = pick_device()
 
-    tokenizer = AutoTokenizer.from_pretrained(str(MODELS_DIR / "distilbert_tokenizer"))
+    tokenizer = AutoTokenizer.from_pretrained(str(models_dir / "distilbert_tokenizer"))
     model = PhishingClassifier()
-    model.load_state_dict(torch.load(MODELS_DIR / "distilbert_tier1.pt",
+    model.load_state_dict(torch.load(models_dir / "distilbert_tier1.pt",
                                      map_location=device, weights_only=True))
     model.to(device)
 
-    frame, hdr = load_split_frame(data_path, ["val"])
+    raw = pd.read_csv(data_path, dtype=str, keep_default_na=False)
+    frame, hdr = load_split_frame(raw, ["val"])
+    if not include_url_only:
+        keep = ~frame["url_only"].values
+        frame, hdr = frame[keep].reset_index(drop=True), hdr[keep]
+        log.info(f"URL-only rows excluded from calibration (use --include-url-only to keep them)")
     enc = EncodedEmails(encode(frame["text"].tolist(), tokenizer, max_len), hdr, frame["label"].values)
     loader = make_loader(enc, tokenizer, 64, shuffle=False)
-    probs, labels = predict_probs(model, loader, device, use_amp=False)
+    probs, labels = predict_probs(model, loader, device)
     return labels, probs
 
 
 def run_distilbert(args) -> dict:
-    y, p = val_probs_distilbert(Path(args.data))
+    models_dir = Path(args.models_dir)
+    y, p = val_probs_distilbert(Path(args.data), models_dir, include_url_only=args.include_url_only)
     log.info(f"Val rows: {len(y):,} | legitimate={int((y == 0).sum()):,} malicious={int((y == 1).sum()):,}")
     if len(np.unique(y)) < 2:
         raise SystemExit("Val split has a single class; cannot calibrate.")
@@ -169,8 +179,9 @@ def run_distilbert(args) -> dict:
         "val_f1": float(best["f1"]),
         "val_fpr": float(best["fpr"]),
     }
-    config = merge_write(THRESHOLD_CONFIG_PATH, updates)
-    log.info(f"Saved DistilBERT thresholds: {THRESHOLD_CONFIG_PATH}")
+    threshold_path = models_dir / "threshold_config.json"
+    config = merge_write(threshold_path, updates)
+    log.info(f"Saved DistilBERT thresholds: {threshold_path}")
     return config
 
 
@@ -231,6 +242,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NETRA threshold calibration")
     parser.add_argument("--model", choices=["distilbert", "rf"], default="distilbert")
     parser.add_argument("--data", type=str, default=str(DATA_PATH))
+    parser.add_argument("--models_dir", type=str, default=str(MODELS_DIR),
+                        help="Folder with distilbert_tier1.pt and its config (default: ml/models)")
+    parser.add_argument("--include-url-only", action="store_true",
+                        help="Also calibrate on PhishTank/OpenPhish URL-only rows (not recommended)")
     parser.add_argument("--suspicious_recall", type=float, default=0.95,
                         help="Recall target that sets the lower edge of the SUSPICIOUS band")
     args = parser.parse_args()
