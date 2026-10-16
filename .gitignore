@@ -50,3 +50,4 @@ ml/evaluation/*.png
 # Runtime-mutated thresholds (committed defaults live in threshold_config.default.json)
 ml/models/threshold_config.json
 ml/models/threshold_config.json.tmp
+ml/models/threshold_config.audit_backup.json
