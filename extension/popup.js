@@ -356,8 +356,11 @@ function displayResults(data) {
     signalTypoStatus.className = "signal-status";
   }
 
-  // Urgency
-  if (signals.urgency_detected) {
+  // Urgency (a payment / credential request under pressure is shown here too)
+  if (signals.bec_detected) {
+    signalUrgencyStatus.textContent = "Payment Request";
+    signalUrgencyStatus.className = "signal-status flagged";
+  } else if (signals.urgency_detected) {
     signalUrgencyStatus.textContent = "High Urgency";
     signalUrgencyStatus.className = "signal-status flagged";
   } else {
@@ -374,8 +377,10 @@ function displayResults(data) {
     signalAuthStatus.className = "signal-status";
   }
 
-  // Suspicious URLs
-  const suspUrls = signals.suspicious_urls || 0;
+  // Suspicious URLs (plain http plus the link checks added after the Tier-1 audit)
+  const suspUrls = (signals.suspicious_urls || 0) + (signals.ip_url_detected ? 1 : 0) +
+    (signals.shortened_url_detected ? 1 : 0) + (signals.executable_link ? 1 : 0) +
+    (signals.risky_file_link ? 1 : 0);
   if (suspUrls > 0) {
     signalUrlsStatus.textContent = `${suspUrls} Flagged`;
     signalUrlsStatus.className = "signal-status flagged";
@@ -388,6 +393,20 @@ function displayResults(data) {
   const timeTextEl = document.getElementById("inference-time-text");
   if (timeTextEl) {
     timeTextEl.textContent = `${(data.processing_time_ms || 0).toFixed(1)} ms`;
+  }
+
+  // Rule layer: say when it changed the model verdict (textContent only).
+  const adjustmentNote = document.getElementById("adjustment-note");
+  if (adjustmentNote) {
+    const modelPct = ((data.model_score || 0) * 100).toFixed(1);
+    let text = "";
+    if (data.adjustment === "trusted_sender") {
+      text = `Model alone: ${modelPct}%. Lowered by the sender check: ${data.adjustment_reason || "trusted sender"}.`;
+    } else if (data.adjustment === "signal_override") {
+      text = `Model alone: ${modelPct}%. Raised by ${data.adjustment_reason || "threat signals"}.`;
+    }
+    adjustmentNote.textContent = text;
+    adjustmentNote.classList.toggle("hidden", !text);
   }
 
   // Smooth scroll to results
@@ -489,7 +508,11 @@ function renderExplanation(x) {
   renderTokens(tokensLegit, x.top_legitimate_tokens, "16, 185, 129");
 
   const notes = [];
-  if (x.override) notes.push("Verdict raised by the multi-signal rule.");
+  if (x.override === "trusted_sender") {
+    notes.push("Verdict lowered: trusted sender, links match the sender's domain.");
+  } else if (x.override) {
+    notes.push("Verdict raised by the multi-signal rule.");
+  }
   if (x.truncated) notes.push("Only the first 256 tokens were analysed.");
   if (!x.converged) notes.push("Approximate: attribution did not fully converge.");
   if (x.method === "signals_only") notes.push("Fallback model: only rule signals are explained.");

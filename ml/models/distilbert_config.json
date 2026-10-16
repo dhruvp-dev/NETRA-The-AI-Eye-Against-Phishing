@@ -1,9 +1,9 @@
 {
   "model": "distilbert-base-uncased",
   "max_length": 256,
-  "confidence_threshold": 0.7,
   "weights_sha256": "653ebaf339448b45044e7e90cb25a034c89c37c46b43279c83966d2466059aaa",
   "header_features_trained": true,
+  "header_auth_learned": false,
   "text_format": "v3",
   "header_features": [
     "spf_pass",
@@ -248,5 +248,11 @@
     "data": "data/processed/unified.csv",
     "pipeline_version": "4",
     "trained_at": "2026-10-16T10:39:50.696251+00:00"
-  }
+  },
+  "known_limitations": [
+    "Audit 2026-10-17 (bugs/tier1_model_bugs.md): every legitimate training row is Enron and most phishing rows are URL-only, so the model scores brand / transactional mail with links as phishing. The reported F1 is for in-distribution benchmark splits only.",
+    "Training data has no SPF/DKIM/DMARC results (all 'none'), so the header branch did not learn authentication. header_auth_learned=false: /explain does not report header attributions; auth is used by the rule layer only.",
+    "Scores are saturated near 0 or 1 (not calibrated).",
+    "Serving mitigations without retraining: windowed scoring of long emails, trusted-sender downgrade and extra threat signals in api/main.py and api/trust.py. A retrain on representative legitimate mail is still required."
+  ]
 }

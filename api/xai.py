@@ -11,6 +11,8 @@ risk score, in probability points:
     model part:    p_m - p0, split over attribution groups in proportion to their IG totals
     override part: p_f - p_m, split equally over the counted signal units. The override is a
                    threshold on a count of interchangeable units, so this is their exact Shapley value.
+    trust part:    when the trusted-sender rule (api/trust.py) lowered the verdict, p_f - p_m (negative)
+                   is one rule component, 'trusted_sender', under sender authentication.
 
     p0 + sum(factor contributions) == p_f
 
@@ -82,7 +84,7 @@ class Explanation(BaseModel):
     baseline_score: float
     model_score: float
     final_score: float
-    override: Optional[Literal["suspicious_floor", "phishing_floor"]] = None
+    override: Optional[Literal["suspicious_floor", "phishing_floor", "trusted_sender"]] = None
     top_phishing_tokens: List[TokenAttribution]
     top_legitimate_tokens: List[TokenAttribution]
     header_attributions: List[FeatureAttribution]
@@ -150,23 +152,35 @@ def aggregate_tokens(words, top_k: int) -> Tuple[List[TokenAttribution], List[To
 
 def override_units(signals: dict, url_feats: dict) -> List[Tuple[str, str, str]]:
     """
-    The units _signal_count adds up, as (factor key, component name, display label):
-    typosquatting_detected + header_auth_failed + min(suspicious_urls, 2), where suspicious_urls
-    is any_http_url + any_phishing_tld + any_typosquatting (taken in that order).
+    The threat units the multi-signal override counts (api/main.py: _signal_count uses this list),
+    as (factor key, component name, display label). A plain http:// link is reported but not counted.
+    A BEC lure (payment/credential request plus pressure) and a link to a program file each count
+    as two units, so either alone gives SUSPICIOUS. Urgent wording only
+    counts next to another unit, because ordinary account mail uses the same words.
     """
     units = []
     if signals.get("typosquatting_detected"):
         units.append(("links", "typosquatting_detected", "look-alike domain"))
     if signals.get("header_auth_failed"):
         units.append(("sender_auth", "header_auth_failed", "failed sender authentication"))
-    url_units = []
-    if url_feats.get("any_http_url"):
-        url_units.append(("links", "non_https_link", "non-HTTPS link"))
     if url_feats.get("any_phishing_tld"):
-        url_units.append(("links", "suspicious_tld", "high-risk TLD"))
-    if url_feats.get("any_typosquatting"):
-        url_units.append(("links", "typosquatting_link", "look-alike link domain"))
-    return units + url_units[:2]
+        units.append(("links", "suspicious_tld", "high-risk TLD"))
+    if signals.get("ip_url_detected"):
+        units.append(("links", "ip_url", "link to an IP address"))
+    if signals.get("shortened_url_detected"):
+        units.append(("links", "shortened_url", "shortened link"))
+    if signals.get("risky_file_link"):
+        units.append(("links", "risky_file_link", "link to an archive or HTML file"))
+    if signals.get("executable_link"):
+        # A program download link is enough for SUSPICIOUS on its own.
+        units.append(("links", "executable_link", "link to a program file"))
+        units.append(("links", "executable_download", "direct program download"))
+    if signals.get("bec_detected"):
+        units.append(("wording", "bec_request", "payment or credential request"))
+        units.append(("wording", "bec_pressure", "pressure or secrecy"))
+    if units and signals.get("urgency_detected"):
+        units.append(("wording", "urgency", "urgent language"))
+    return units
 
 
 def _model_groups(ig) -> Dict[str, float]:
@@ -200,6 +214,7 @@ def fuse(
     hdr_values: Sequence[float],
     headers_used: bool,
     top_k: int,
+    trust_reasons: Sequence[str] = (),
 ) -> Explanation:
     """
     Build the explanation. `decided` is the output of _decide on p_model; `model_classification`
@@ -209,7 +224,10 @@ def fuse(
     final = float(decided["risk_score"])
     cls = decided["classification"]
     override = None
-    if cls != model_classification:
+    trusted = decided.get("adjustment") == "trusted_sender"
+    if trusted:
+        override = "trusted_sender"
+    elif cls != model_classification:
         override = "phishing_floor" if cls == "PHISHING" else "suspicious_floor"
 
     components: Dict[str, List[FactorComponent]] = {k: [] for k in FACTOR_LABELS}
@@ -240,11 +258,16 @@ def fuse(
 
     # Override part: p_f - p_m over the counted units (zero without an override).
     units = override_units(signals, url_feats)
-    per_unit = (final - p_model) / len(units) if override and units else 0.0
+    per_unit = (final - p_model) / len(units) if override and not trusted and units else 0.0
     for key, name, _label in units:
         components[key].append(FactorComponent(source="rule", name=name, contribution=round(per_unit, 4)))
+    if trusted:
+        components["sender_auth"].append(FactorComponent(source="rule", name="trusted_sender",
+                                                         contribution=round(final - p_model, 4)))
 
     evidence = _evidence(ig, signals, units, urls, auth, reply_to_matches)
+    if trusted:
+        evidence["sender_auth"].extend(r for r in trust_reasons if r not in evidence["sender_auth"])
 
     factors = []
     for key, comps in components.items():
@@ -276,7 +299,7 @@ def fuse(
         header_attributions=header_attr,
         headers_used_by_model=bool(ig is not None and headers_used),
         threat_factors=factors,
-        summary=summarize(cls, final, factors, override, p_model, [u[2] for u in units]),
+        summary=summarize(cls, final, factors, override, p_model, [u[2] for u in units], trust_reasons),
         completeness_delta=round(ig.delta, 4) if ig is not None else None,
         converged=rel <= CONVERGENCE_TOLERANCE,
         truncated=bool(ig.truncated) if ig is not None else False,
@@ -326,7 +349,7 @@ def _join(items: List[str]) -> str:
 
 
 def summarize(classification: str, final: float, factors: List[ThreatFactor], override: Optional[str],
-              p_model: float, unit_labels: List[str]) -> str:
+              p_model: float, unit_labels: List[str], trust_reasons: Sequence[str] = ()) -> str:
     """One deterministic sentence (or three) explaining the verdict. No generated text."""
     head = f"{classification} (risk {final:.0%})."
 
@@ -339,7 +362,12 @@ def summarize(classification: str, final: float, factors: List[ThreatFactor], ov
     notable = [f for f in raising if f.contribution >= MIN_MENTION]
     lowering = sorted((f for f in factors if f.contribution <= -MIN_MENTION), key=lambda f: f.contribution)
     parts = [head]
-    if override:
+    if override == "trusted_sender":
+        why = "; ".join(trust_reasons) if trust_reasons else "trusted sender"
+        parts.append(f"The model alone scored {p_model:.0%}, but the sender check passed ({why}), so the verdict was lowered to "
+                     f"{classification}. The model over-flags brand and notification mail; this rule "
+                     "checks the sender and where the links go.")
+    elif override:
         # The rule signals decided this verdict, not the model score, so they lead.
         parts.append(f"The model alone scored {p_model:.0%}, but {len(unit_labels)} independent threat signals "
                      f"({_join(unit_labels)}) raised the verdict to {classification}.")

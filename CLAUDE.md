@@ -27,9 +27,18 @@ with RFC header features, served by FastAPI, with a calibrated Random Forest as 
        otherwise                            → LEGITIMATE
                           │
                           ▼
-   Multi-signal override (LEGITIMATE only):
-       >= 3 threat signals → PHISHING     (score floored at phishing_threshold)
-       >= 2 threat signals → SUSPICIOUS   (score floored at suspicious_lower)
+   Long emails: head window + up to 4 body windows (400 chars, subject and URL lines repeated);
+   the highest window score is the model score.
+                          │
+                          ▼
+   Trusted-sender rule (api/trust.py), unless a BEC lure fired:
+       known brand domain + all links aligned          → LEGITIMATE (score capped at suspicious_lower / 2)
+       authenticated unknown domain + links aligned    → PHISHING becomes SUSPICIOUS
+                          │
+                          ▼
+   Multi-signal override (LEGITIMATE only; units from api/xai.py: override_units):
+       >= 3 threat units → PHISHING     (score floored at phishing_threshold)
+       >= 2 threat units → SUSPICIOUS   (score floored at suspicious_lower)
 ```
 
 ### Core Components
@@ -48,17 +57,30 @@ with RFC header features, served by FastAPI, with a calibrated Random Forest as 
      Steps are placed adaptively (refined forward scan) because F jumps sharply along the path.
      Uses `PhishingClassifier.forward_embeds`.
    - `api/xai.py`: the model part (p_m − p0) and the override part (p_f − p_m, split equally per counted
-     signal unit) are reported per threat factor. Invariant: `baseline_score + Σ contributions = risk_score`.
+     signal unit, or one negative `trusted_sender` component when the trust rule lowered the verdict) are
+     reported per threat factor. Invariant: `baseline_score + Σ contributions = risk_score`.
+   - For a long email, IG runs on the window that gave the model score.
    - `/explain` has its own one-slot semaphore and a 5/min limit on top of the shared one.
      It takes seconds on CPU and never runs inside `/predict`.
-3. **Rate limiter (`api/rate_limiter.py`)**
+3. **Rule layer (`api/main.py: _verdict / _decide`, `api/trust.py`)**
+   - Added after the Tier-1 audit (`bugs/tier1_model_bugs.md`) because the shipped checkpoint over-flags brand
+     and transactional mail and cannot be retrained in time. It works around the model; it does not fix it.
+   - `api/trust.py: assess` → `TrustAssessment.level` is `known` (sender's registrable domain in `KNOWN_ORGS`, not
+     freemail), `verified` (DMARC pass, or SPF+DKIM pass) or `None`. Either level needs every link to be on the
+     sender's org, another known org or `NEUTRAL_LINK_DOMAINS`, with no IP / shortener / user-content host /
+     high-risk TLD / look-alike, and Reply-To in the sender's org. Any auth failure or look-alike sender blocks it.
+   - Threat units (`api/xai.py: override_units`, the one list): look-alike domain, auth failure, high-risk TLD, IP link,
+     shortener, archive/HTML link, program-file link (2 units), BEC lure (2 units), urgency (only next to another unit).
+     A plain `http://` link is reported in `suspicious_urls` but not counted.
+   - `/predict` adds `model_score`, `adjustment` (`trusted_sender` | `signal_override`) and `adjustment_reason`.
+4. **Rate limiter (`api/rate_limiter.py`)**
    - Sliding window, 20 requests/minute per client, on `/predict`, `/explain` and `/admin/recalibrate`.
    - Memory is bounded (LRU cap plus expiry sweep).
-4. **Shared model code (`ml/distilbert_model.py`, `ml/features/*`)**
+5. **Shared model code (`ml/distilbert_model.py`, `ml/features/*`)**
    - `PhishingClassifier` is defined once. Training and serving import it. Module names are part of the state dict.
    - `text_builder.py` builds the model input. Training and serving must use it. `build_model_text_with_spans`
      also returns where each field sits in that text (used by `/explain`). `build_model_text` wraps it.
-5. **Chrome Extension (`extension/`)**
+6. **Chrome Extension (`extension/`)**
    - Manifest V3. Scans Gmail and active pages. Reads `classification`, `risk_score`, `signals` and `processing_time_ms` from `/predict`. Keep these fields stable.
    - "Why this verdict?" calls `/explain`. `content.js` handles `highlightTokens` / `clearHighlights` in the open
      Gmail / Outlook body (DOM APIs only, no `innerHTML`).
@@ -76,7 +98,7 @@ python -m uvicorn api.main:app --reload --port 8000
 
 # Tests
 pytest tests/                                   # unit + API tests, no weights needed
-python tests/stress_test_tier1.py               # end-to-end verdicts + latency; needs weights; exit 1 on failure
+python tests/stress_test_tier1.py               # 46 verdicts (core / legit brand mail / phishing) + latency; needs weights; exit 1 on failure
 python tests/xai_sanity.py                      # /explain deletion, randomisation, completeness, latency; needs weights
 ```
 
@@ -112,8 +134,9 @@ Notebooks: `notebooks/NETRA_DistilBERT_Training.ipynb` (Colab) and
 - **Tier-1 DistilBERT**: `ml/models/distilbert_tier1.pt` (~266 MB). Release `v2.0.0` is the shipped
   checkpoint. Its digest is recorded in `ml/models/distilbert_config.json` (`weights_sha256`).
 - **Config keys that control inference** (`ml/models/distilbert_config.json`):
-  - `header_features_trained` (default `false`): when false, the header vector is zeros, which is
-    what the shipped checkpoint was trained with.
+  - `header_features_trained` (default `false`): when false, the header vector is zeros (legacy checkpoints).
+  - `header_auth_learned` (default `true`): `false` for v2.0.0, whose training data had no auth results.
+    The header vector is still fed to the model, but `/explain` does not report header attributions.
   - `text_format` (default `body_only`): `body_only` sends the raw body text. `v3` sends
     `build_model_text(subject, body, urls)`. Retrained checkpoints from this pipeline set `v3` and
     `header_features_trained: true`.
@@ -133,6 +156,7 @@ NETRA/
 ├── api/
 │   ├── main.py                      # FastAPI app: /health, /predict, /explain, /admin/recalibrate
 │   ├── xai.py                       # /explain fusion: threat factors, Shapley override split, schemas, summary
+│   ├── trust.py                     # Trusted-sender / link-alignment rule and curated domain lists
 │   └── rate_limiter.py              # Sliding-window limiter with bounded memory
 ├── ml/
 │   ├── data_pipeline.py             # Raw corpora → unified.csv (schema, labels, splits)
@@ -158,6 +182,7 @@ NETRA/
 │   ├── test_api.py                  # API behaviour (health, validation, limits, auth, decisions)
 │   ├── test_features.py             # Features, pipeline parsing, splits, sweep, limiter
 │   ├── test_explain.py              # IG engine (tiny random model) + fusion algebra
+│   ├── test_trust.py                # Trust rule, new signals, windowed scoring, threshold band guard
 │   ├── stress_test_tier1.py         # End-to-end verdict + latency script (not collected by pytest)
 │   └── xai_sanity.py                # /explain faithfulness + latency script (not collected by pytest)
 └── docs/                            # Decisions and design notes
@@ -193,7 +218,10 @@ NETRA/
 4. **Thresholds**
    - Live values come from `ml/models/threshold_config.json`, with a fallback to `threshold_config.default.json`.
    - Defaults: `score < 0.08` LEGITIMATE, `0.08 <= score < 0.25` SUSPICIOUS, `score >= 0.25` PHISHING.
+   - The SUSPICIOUS band must be at least `MIN_SUSPICIOUS_BAND` (0.03) wide (API and calibration).
+     Calibration does not write when the F1 curve is flat over more than 0.5 (saturated scores) unless `--force`.
    - Calibration writes only its own keys (read-merge-write). Admin updates persist before in-memory state changes.
+   - `threshold_config.json` is machine-local (gitignored); a fresh checkout uses the committed defaults.
 5. **Proxy-aware networking**
    - Client IP comes from `api/main.py: client_ip`. It reads `X-Forwarded-For` only when
      `NETRA_TRUSTED_PROXY_HOPS > 0`, and then takes the entry that many hops from the right.

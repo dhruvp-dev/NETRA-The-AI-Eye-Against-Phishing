@@ -29,13 +29,15 @@ import hmac
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.request
 from contextlib import asynccontextmanager
 from email.utils import parseaddr
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -49,7 +51,8 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 from typing import Annotated
 
 from api.rate_limiter import SlidingWindowRateLimiter
-from api.xai import Explanation, fuse, sigmoid
+from api.trust import TrustAssessment, assess, is_shortener, url_host
+from api.xai import Explanation, fuse, override_units, sigmoid
 from ml.features.header_features import HEADER_FEATURE_NAMES, extract as header_extract, normalize_auth
 from ml.features.text_builder import Span, build_model_text_with_spans, extract_urls
 from ml.features.text_features import URGENCY_KEYWORDS
@@ -83,6 +86,13 @@ DEFAULT_SUSPICIOUS_LOWER = 0.0800
 CRITICAL_RISK_SCORE = 0.50          # PHISHING at or above this is reported as CRITICAL
 SIGNAL_OVERRIDE_SUSPICIOUS = 2      # LEGITIMATE + this many threat signals -> SUSPICIOUS
 SIGNAL_OVERRIDE_PHISHING = 3        # LEGITIMATE + this many threat signals -> PHISHING
+MIN_SUSPICIOUS_BAND = 0.03          # SUSPICIOUS must be a real band (audit B2: a 0.0002 band was unreachable)
+
+# Long emails are scored in windows (audit B3): the head plus up to MAX_EXTRA_WINDOWS body chunks,
+# each with the subject and URL lines, and the highest score wins.
+MAX_EXTRA_WINDOWS = 4
+WINDOW_CHARS = 400
+WINDOW_OVERLAP_CHARS = 80
 
 # ---------------------------------------------------------------------------
 # Request limits
@@ -246,7 +256,7 @@ state = ModelState()
 # Threshold config
 # ---------------------------------------------------------------------------
 def _valid_thresholds(lower: float, phishing: float) -> bool:
-    return 0.0 < lower < phishing <= 1.0
+    return 0.0 < lower and phishing <= 1.0 and phishing - lower >= MIN_SUSPICIOUS_BAND - 1e-9
 
 
 def _load_thresholds() -> None:
@@ -393,15 +403,39 @@ class PredictRequest(BaseModel):
 
     subject: Optional[Short] = None
     body_text: Annotated[str, StringConstraints(max_length=MAX_BODY_CHARS)] = Field(
-        ..., description="Full email body text")
+        "", description="Full email body text (may be empty when subject or URLs are given)")
     urls: Optional[List[UrlStr]] = Field(default=None, max_length=MAX_URLS,
-                                         description="URLs extracted from the email")
+                                         description="URLs extracted from the email (first 50 kept)")
     sender: Optional[Address] = None
     reply_to: Optional[Address] = None
     headers: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Parsed auth results. Keys: 'spf', 'dkim', 'dmarc' -> 'pass'|'fail'|'none'",
     )
+
+    # Real emails exceed these limits (long tracking URLs, many links, long display names).
+    # Clip them instead of rejecting the email with 422 (audit B11).
+    @field_validator("urls", mode="before")
+    @classmethod
+    def _clip_urls(cls, v):
+        if isinstance(v, list):
+            v = [u for u in v if not isinstance(u, str) or len(u) <= MAX_URL_CHARS][:MAX_URLS]
+        return v
+
+    @field_validator("sender", "reply_to", mode="before")
+    @classmethod
+    def _clip_address(cls, v):
+        return v[:MAX_ADDRESS_CHARS] if isinstance(v, str) else v
+
+    @field_validator("subject", mode="before")
+    @classmethod
+    def _clip_subject(cls, v):
+        return v[:MAX_SUBJECT_CHARS] if isinstance(v, str) else v
+
+    @field_validator("body_text", mode="before")
+    @classmethod
+    def _none_body_is_empty(cls, v):
+        return "" if v is None else v
 
     @field_validator("headers")
     @classmethod
@@ -416,6 +450,12 @@ class SignalsDict(BaseModel):
     urgency_detected: bool
     suspicious_urls: int
     typosquatting_detected: bool
+    # Added after the Tier-1 audit (additive; older clients ignore them).
+    ip_url_detected: bool = False
+    shortened_url_detected: bool = False
+    risky_file_link: bool = False
+    executable_link: bool = False
+    bec_detected: bool = False
 
 
 class PredictResponse(BaseModel):
@@ -427,6 +467,10 @@ class PredictResponse(BaseModel):
     threshold_used: float
     signals: SignalsDict
     processing_time_ms: float
+    model_score: Optional[float] = Field(None, description="Model probability before the rule layer")
+    adjustment: Optional[Literal["trusted_sender", "signal_override"]] = Field(
+        None, description="Rule that changed the model verdict, if any")
+    adjustment_reason: Optional[str] = None
 
 
 class ExplainRequest(PredictRequest):
@@ -464,11 +508,47 @@ def _sender_domain(sender: Optional[str]) -> str:
     return addr.rsplit("@", 1)[1].lower() if "@" in addr else ""
 
 
+# Business-email-compromise lure: a request for money or credentials ...
+_BEC_REQUEST = re.compile(
+    r"\b(wire (the |a )?(transfer|payment|funds)|wire transfer|bank transfer|gift ?cards?|itunes cards?|"
+    r"google play cards?|steam cards?|send (me )?the (codes?|card numbers?)|scratch (off )?the|"
+    r"(change|update)d? (of |to )?(our |my |the )?(bank |banking )?(bank|banking|account|payment|direct deposit|payroll) "
+    r"(details|information|info)|new bank account|update (my |the )?payroll|"
+    r"process (a|the) payment|make (a|the) payment (today|now|asap)|outstanding invoice|overdue invoice|"
+    r"invoice (is )?(overdue|past due)|pay(ment)? (is )?overdue|(send|pay|transfer)\b.{0,30}\b(bitcoin|btc|crypto)|"
+    r"(send|share) (me )?(your )?(password|login|credentials|otp|verification code))\b",
+    re.IGNORECASE)
+# ... combined with pressure or secrecy.
+_BEC_PRESSURE = re.compile(
+    r"\b(urgent(ly)?|asap|immediately|right away|right now|within (the )?(hour|\d+ (hours?|minutes?))|"
+    r"before (the )?end of (the )?day|by eod|today|confidential|discreet|between us|keep (this|it) (quiet|private)|"
+    r"(don'?t|do not) (call|tell|discuss)|in a meeting|are you (available|at your desk|around)|quick favou?r|"
+    r"can'?t talk|final notice|last (notice|reminder)|legal action|penalt(y|ies)|suspend(ed)?)\b",
+    re.IGNORECASE)
+_EXECUTABLE_FILE = re.compile(r"\.(exe|scr|bat|cmd|pif|js|jse|vbs|vbe|wsf|hta|msi|lnk|ps1)$", re.IGNORECASE)
+_RISKY_FILE = re.compile(r"\.(iso|img|zip|rar|7z|html?)$", re.IGNORECASE)
+
+
+def _link_path(url: str) -> str:
+    try:
+        return (urlparse(url if "://" in url else f"http://{url}").path or "").rstrip("/")
+    except ValueError:
+        return ""
+
+
+def _executable_link(url: str) -> bool:
+    return bool(_EXECUTABLE_FILE.search(_link_path(url)))
+
+
+def _risky_file_link(url: str) -> bool:
+    return bool(_RISKY_FILE.search(_link_path(url)))
+
+
 def _extract_signals(req: PredictRequest, urls: List[str]) -> dict:
     """Interpretable signals for the response and for the multi-signal override."""
     hdrs = req.headers or {}
-    auth_values = [str(hdrs.get(k, "none")).lower() for k in ("spf", "dkim", "dmarc")]
-    header_auth_failed = any(v in ("fail", "softfail") for v in auth_values)
+    auth_values = [normalize_auth(hdrs.get(k)) for k in ("spf", "dkim", "dmarc")]
+    header_auth_failed = "fail" in auth_values
 
     body_lower = (req.body_text or "").lower()
     urgency_detected = sum(1 for kw in URGENCY_KEYWORDS if kw in body_lower) >= 2
@@ -483,18 +563,23 @@ def _extract_signals(req: PredictRequest, urls: List[str]) -> dict:
         if domain:
             typosquatting = bool(check_typosquatting(domain)[0])
 
+    text = f"{req.subject or ''}\n{req.body_text or ''}"
     return {
         "header_auth_failed": header_auth_failed,
         "urgency_detected": urgency_detected,
         "suspicious_urls": suspicious_urls,
         "typosquatting_detected": typosquatting,
+        "ip_url_detected": bool(url_feats["any_ip_url"]),
+        "shortened_url_detected": any(is_shortener(url_host(u)) for u in urls),
+        "risky_file_link": any(_risky_file_link(u) for u in urls),
+        "executable_link": any(_executable_link(u) for u in urls),
+        "bec_detected": bool(_BEC_REQUEST.search(text) and _BEC_PRESSURE.search(text)),
     }
 
 
-def _signal_count(signals: dict) -> int:
-    return (int(signals["typosquatting_detected"])
-            + int(signals["header_auth_failed"])
-            + min(signals["suspicious_urls"], 2))
+def _signal_count(signals: dict, url_feats: Optional[dict] = None) -> int:
+    """Number of threat units (api/xai.py: override_units is the single list of them)."""
+    return len(override_units(signals, url_feats or {}))
 
 
 # ---------------------------------------------------------------------------
@@ -517,29 +602,127 @@ def _risk_level(classification: str, risk_score: float) -> str:
     return "CRITICAL" if risk_score >= CRITICAL_RISK_SCORE else "HIGH"
 
 
-def _decide(risk_score: float, confidence: float, signal_count: int) -> dict:
+def _decide(risk_score: float, confidence: float, signal_count: int,
+            trust: Optional[TrustAssessment] = None, bec: bool = False) -> dict:
     """
-    Verdict from the model score, then the multi-signal override.
-    The override can only raise severity, and it uses the active thresholds as floors.
+    Verdict from the model score, then the rule layer:
+      1. Trusted sender, links aligned, no BEC lure (api/trust.py) -> lower the verdict.
+         Known brand: LEGITIMATE. Authenticated but unknown domain: PHISHING becomes SUSPICIOUS.
+      2. Otherwise the multi-signal override can raise a LEGITIMATE verdict, using the active
+         thresholds as floors.
     """
+    model_score = risk_score
     cls = _classify(risk_score)
-    if cls == "LEGITIMATE":
+    adjustment, reason = None, None
+    level = trust.level if trust is not None and not bec else None
+    if level == "known" and cls != "LEGITIMATE":
+        cls, risk_score = "LEGITIMATE", min(risk_score, state.suspicious_lower / 2)
+        adjustment, reason = "trusted_sender", "; ".join(trust.reasons)
+    elif level == "verified" and cls == "PHISHING":
+        mid = (state.suspicious_lower + state.phishing_threshold) / 2
+        cls, risk_score = "SUSPICIOUS", min(risk_score, mid)
+        adjustment, reason = "trusted_sender", "; ".join(trust.reasons)
+    elif cls == "LEGITIMATE":
         if signal_count >= SIGNAL_OVERRIDE_PHISHING:
             cls, risk_score = "PHISHING", max(risk_score, state.phishing_threshold)
         elif signal_count >= SIGNAL_OVERRIDE_SUSPICIOUS:
             cls, risk_score = "SUSPICIOUS", max(risk_score, state.suspicious_lower)
+        if cls != "LEGITIMATE":
+            adjustment, reason = "signal_override", f"{signal_count} threat signals"
     return {
         "classification": cls,
         "risk_score": round(risk_score, 4),
         "confidence": round(confidence, 4),
         "risk_level": _risk_level(cls, risk_score),
         "threshold_used": round(state.phishing_threshold, 4),
+        "model_score": round(model_score, 4),
+        "adjustment": adjustment,
+        "adjustment_reason": reason,
     }
+
+
+def _verdict(req: PredictRequest, urls: List[str], signals: dict, risk_score: float,
+             confidence: float) -> dict:
+    """Model score + request evidence -> final decision (shared by /predict and /explain)."""
+    trust = assess(req.sender, req.reply_to, req.headers, urls)
+    result = _decide(risk_score, confidence, _signal_count(signals, url_extract(urls)),
+                     trust, signals["bec_detected"])
+    result["trust"] = trust
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
+def _model_text(req: PredictRequest, body: str, body_offset: int, urls: List[str]):
+    """
+    Model text for one body (or body chunk) in the checkpoint's own input format. `body_offset` is
+    where `body` starts inside req.body_text, so explanation offsets map back to the original body.
+    """
+    if state.db_config.get("text_format", "body_only") == "body_only":
+        return body, [Span("body", None, 0, len(body), body_offset)]
+    text, spans = build_model_text_with_spans(req.subject, body, urls)
+    return text, [sp._replace(field_offset=sp.field_offset + body_offset) if sp.field == "body" else sp
+                  for sp in spans]
+
+
+def _body_chunks(body: str) -> List[Tuple[int, str]]:
+    """Overlapping ~WINDOW_CHARS chunks of the body, cut at whitespace, as (start offset, text)."""
+    chunks, start, n = [], 0, len(body)
+    while start < n:
+        end = min(n, start + WINDOW_CHARS)
+        if end < n:
+            cut = body.rfind(" ", start + WINDOW_CHARS // 2, end)
+            end = cut if cut > start else end
+        chunks.append((start, body[start:end]))
+        if end >= n:
+            break
+        nxt = body.find(" ", max(start + 1, end - WINDOW_OVERLAP_CHARS), end)
+        start = nxt + 1 if nxt > start else end
+    return chunks
+
+
+def _n_tokens(text: str) -> int:
+    ids = state.db_tokenizer(text, add_special_tokens=True, truncation=False)["input_ids"]
+    return int(ids.shape[-1]) if hasattr(ids, "shape") else len(ids)
+
+
+def _model_windows(req: PredictRequest, urls: List[str]) -> List[Tuple[str, List[Span]]]:
+    """
+    Texts the model scores for this email. A text that fits in max_length is one window (scored
+    exactly as before). A longer one is the head window plus up to MAX_EXTRA_WINDOWS body chunks
+    (always the last one), each repeating the subject and URL lines, so content and links after the
+    first 256 tokens are read too (audit B3).
+    """
+    max_len = int(state.db_config.get("max_length", 256))
+    head = _model_text(req, req.body_text or "", 0, urls)
+    # A token is at least one character, so a prefix of 16 chars per token is plenty to decide.
+    if _n_tokens(head[0][: max_len * 16]) <= max_len:
+        return [head]
+    chunks = _body_chunks(req.body_text or "")[1:]   # the first chunk is inside the head window
+    if len(chunks) > MAX_EXTRA_WINDOWS:
+        picks = np.linspace(0, len(chunks) - 1, MAX_EXTRA_WINDOWS).round().astype(int)
+        chunks = [chunks[i] for i in dict.fromkeys(picks.tolist())]
+    return [head] + [_model_text(req, chunk, start, urls) for start, chunk in chunks]
+
+
+def _header_values(req: PredictRequest) -> List[float]:
+    return _prepare_distilbert_inputs(req, [])[2]
+
+
+def _score_windows(windows: List[str], hdr_values: List[float]) -> np.ndarray:
+    """Phishing-class softmax rows for each window text, in one batched forward pass."""
+    import torch
+
+    max_len = int(state.db_config.get("max_length", 256))
+    enc = state.db_tokenizer(windows if len(windows) > 1 else windows[0], max_length=max_len,
+                             truncation=True, padding="max_length", return_tensors="pt")
+    hdr_tensor = torch.tensor([hdr_values] * len(windows), dtype=torch.float32)
+    with torch.no_grad():
+        logits = state.db_model(enc["input_ids"], enc["attention_mask"], hdr_tensor)
+        return torch.softmax(logits, dim=1).numpy()
+
+
 def _prepare_distilbert_inputs(req: PredictRequest, urls: List[str]):
     """
     Request -> (model text, field spans, header values, header baseline) in the checkpoint's own
@@ -549,11 +732,7 @@ def _prepare_distilbert_inputs(req: PredictRequest, urls: List[str]):
     flags say so. New checkpoints (retrained with the fixed pipeline) set both flags.
     """
     cfg = state.db_config
-    if cfg.get("text_format", "body_only") == "body_only":
-        text = req.body_text or ""
-        spans = [Span("body", None, 0, len(text), 0)]
-    else:
-        text, spans = build_model_text_with_spans(req.subject, req.body_text, urls)
+    text, spans = _model_text(req, req.body_text or "", 0, urls)
 
     if cfg.get("header_features_trained", False):
         hdr = header_extract(req.headers or {}, req.sender or "", req.reply_to or "")
@@ -567,19 +746,14 @@ def _prepare_distilbert_inputs(req: PredictRequest, urls: List[str]):
 
 
 def _score_distilbert(req: PredictRequest, urls: List[str]) -> Tuple[float, float]:
-    """Returns (phishing probability, model confidence) using the checkpoint's own input format."""
-    import torch
-
-    max_len = int(state.db_config.get("max_length", 256))
-    text, _spans, hdr_values, _ = _prepare_distilbert_inputs(req, urls)
-
-    enc = state.db_tokenizer(text, max_length=max_len, truncation=True,
-                             padding="max_length", return_tensors="pt")
-    hdr_tensor = torch.tensor([hdr_values], dtype=torch.float32)
-    with torch.no_grad():
-        logits = state.db_model(enc["input_ids"], enc["attention_mask"], hdr_tensor)
-        proba = torch.softmax(logits, dim=1)[0].numpy()
-    return float(proba[1]), float(max(proba))
+    """
+    Returns (phishing probability, model confidence) using the checkpoint's own input format.
+    Long emails: the highest-scoring window decides (see _model_windows).
+    """
+    windows = _model_windows(req, urls)
+    proba = _score_windows([w[0] for w in windows], _header_values(req))
+    best = int(np.argmax(proba[:, 1]))
+    return float(proba[best, 1]), float(max(proba[best]))
 
 
 def _score_rf(req: PredictRequest, urls: List[str]) -> Tuple[float, float]:
@@ -653,18 +827,30 @@ def _check_ready(req: PredictRequest) -> None:
             "error": "model_not_loaded",
             "message": "No model loaded. Train with ml/train_distilbert.py or place the weights in ml/models/.",
         })
-    if not req.body_text or not req.body_text.strip():
-        raise HTTPException(status_code=422, detail="body_text must not be empty.")
+    # HTML-only / image-only mail has no body text; subject and links are still worth scoring.
+    if not (req.body_text or "").strip() and not (req.subject or "").strip() and not req.urls:
+        raise HTTPException(status_code=422, detail="Provide body_text, subject or urls.")
 
 
 def _explain_distilbert(req: PredictRequest, urls: List[str]):
-    """Integrated Gradients on the served input. Returns (IGResult, hdr_values, headers_used)."""
+    """
+    Integrated Gradients on the served input. For a long email that is the window /predict took
+    its score from, so both endpoints report the same score. Returns (IGResult, hdr_values,
+    headers_used). Header attributions are only reported when the checkpoint learned auth results.
+    """
     from ml.explain import integrated_gradients
 
-    text, spans, hdr_values, hdr_baseline = _prepare_distilbert_inputs(req, urls)
+    cfg = state.db_config
+    _text, _spans, hdr_values, hdr_baseline = _prepare_distilbert_inputs(req, urls)
+    windows = _model_windows(req, urls)
+    best = 0
+    if len(windows) > 1:
+        best = int(np.argmax(_score_windows([w[0] for w in windows], hdr_values)[:, 1]))
+    text, spans = windows[best]
     ig = integrated_gradients(state.db_model, state.db_tokenizer, text, spans, hdr_values, hdr_baseline,
-                              max_length=int(state.db_config.get("max_length", 256)), n_steps=_xai_steps())
-    return ig, hdr_values, bool(state.db_config.get("header_features_trained", False))
+                              max_length=int(cfg.get("max_length", 256)), n_steps=_xai_steps())
+    headers_used = bool(cfg.get("header_features_trained", False)) and cfg.get("header_auth_learned", True)
+    return ig, hdr_values, bool(headers_used)
 
 
 @app.post("/predict", response_model=PredictResponse, tags=["inference"])
@@ -684,11 +870,12 @@ async def predict(req: PredictRequest):
             # other requests are not blocked while it runs.
             risk_score, confidence = await asyncio.to_thread(score_fn, req, urls)
 
-        result = _decide(risk_score, confidence, _signal_count(signals))
+        result = _verdict(req, urls, signals, risk_score, confidence)
         elapsed = round((time.perf_counter() - t0) * 1000, 2)
 
         log.info(f"Predict [{state.model_type}]: {result['classification']} "
-                 f"score={result['risk_score']:.4f} elapsed={elapsed}ms")
+                 f"score={result['risk_score']:.4f} model={result['model_score']:.4f} "
+                 f"adjustment={result['adjustment']} elapsed={elapsed}ms")
 
         return PredictResponse(
             classification=result["classification"],
@@ -699,6 +886,9 @@ async def predict(req: PredictRequest):
             threshold_used=result["threshold_used"],
             signals=SignalsDict(**signals),
             processing_time_ms=elapsed,
+            model_score=result["model_score"],
+            adjustment=result["adjustment"],
+            adjustment_reason=result["adjustment_reason"],
         )
     except HTTPException:
         raise
@@ -733,7 +923,7 @@ async def explain(req: ExplainRequest):
                 ig, hdr_values, headers_used = None, [], False
                 risk_score, confidence = await asyncio.to_thread(_score_rf, req, urls)
 
-        result = _decide(risk_score, confidence, _signal_count(signals))
+        result = _verdict(req, urls, signals, risk_score, confidence)
         hdrs = req.headers or {}
         explanation = fuse(
             ig, signals, url_extract(urls), urls,
@@ -742,6 +932,7 @@ async def explain(req: ExplainRequest):
                                   ["sender_domain_matches_reply_to"]),
             decided=result, model_classification=_classify(risk_score), p_model=risk_score,
             hdr_values=hdr_values, headers_used=headers_used, top_k=req.top_k,
+            trust_reasons=result["trust"].reasons,
         )
         elapsed = round((time.perf_counter() - t0) * 1000, 2)
         explanation.explain_time_ms = elapsed
@@ -758,6 +949,9 @@ async def explain(req: ExplainRequest):
             threshold_used=result["threshold_used"],
             signals=SignalsDict(**signals),
             processing_time_ms=elapsed,
+            model_score=result["model_score"],
+            adjustment=result["adjustment"],
+            adjustment_reason=result["adjustment_reason"],
             explanation=explanation,
         )
     except HTTPException:
@@ -772,7 +966,8 @@ async def explain(req: ExplainRequest):
 def recalibrate(req: RecalibrateRequest):
     if not _valid_thresholds(req.suspicious_lower, req.phishing_threshold):
         raise HTTPException(status_code=422,
-                            detail="Require 0 < suspicious_lower < phishing_threshold <= 1.")
+                            detail=f"Require 0 < suspicious_lower, phishing_threshold <= 1 and a SUSPICIOUS "
+                                   f"band of at least {MIN_SUSPICIOUS_BAND}.")
 
     updates = {
         "phishing_threshold": req.phishing_threshold,

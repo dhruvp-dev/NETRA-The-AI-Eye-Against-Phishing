@@ -89,10 +89,29 @@ def test_predict_422_on_oversized_body(client, monkeypatch):
     assert client.post("/predict", json=too_big).status_code == 422
 
 
-def test_predict_422_on_too_many_urls(client, monkeypatch):
+def test_predict_clips_too_many_urls_and_long_fields(client, monkeypatch):
+    """Real emails exceed the limits; they are clipped, not rejected (audit B11)."""
+    captured = {}
+
+    def fake(req, urls):
+        captured["req"] = req
+        return 0.0, 1.0
+
+    monkeypatch.setattr(main.state, "db_ready", True)
+    monkeypatch.setattr(main, "_score_distilbert", fake)
+    payload = {"body_text": "hello",
+               "urls": [f"https://x{i}.example.com" for i in range(main.MAX_URLS + 5)]
+                       + ["https://a.example.com/" + "p" * main.MAX_URL_CHARS],
+               "sender": "x" * (main.MAX_ADDRESS_CHARS + 10) + "@example.com"}
+    assert client.post("/predict", json=payload).status_code == 200
+    assert len(captured["req"].urls) == main.MAX_URLS
+    assert len(captured["req"].sender) == main.MAX_ADDRESS_CHARS
+
+
+def test_predict_accepts_empty_body_with_subject(client, monkeypatch):
     loaded_with_score(monkeypatch, 0.0)
-    payload = {"body_text": "hello", "urls": [f"https://x{i}.example.com" for i in range(main.MAX_URLS + 1)]}
-    assert client.post("/predict", json=payload).status_code == 422
+    r = client.post("/predict", json={"body_text": "", "subject": "Your invoice", "urls": ["https://a.example.com"]})
+    assert r.status_code == 200
 
 
 def test_predict_422_on_too_many_header_keys(client, monkeypatch):
@@ -135,7 +154,7 @@ def test_signal_override_reaches_phishing_with_three_signals(client, monkeypatch
     payload = {
         "body_text": "Please review.",
         "sender": "it@paypa1-secure.com",                  # typosquatted sender domain
-        "urls": ["http://example.com/login"],              # http -> suspicious URL
+        "urls": ["http://192.168.10.5/login"],             # link to an IP address
         "headers": {"spf": "fail", "dkim": "none", "dmarc": "none"},
     }
     body = client.post("/predict", json=payload).json()
@@ -324,7 +343,9 @@ def test_internal_error_message_is_generic(client, monkeypatch):
 # /explain
 # ---------------------------------------------------------------------------
 PREDICT_KEYS = {"classification", "risk_score", "confidence", "risk_level", "model_type",
-                "threshold_used", "signals", "processing_time_ms"}
+                "threshold_used", "signals", "processing_time_ms",
+                # additive, after the Tier-1 audit
+                "model_score", "adjustment", "adjustment_reason"}
 
 PHISH = {
     "subject": "Account suspended",

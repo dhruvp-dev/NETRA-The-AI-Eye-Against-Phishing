@@ -208,12 +208,12 @@ def test_fusion_parts_add_up_to_final_score():
 
 def test_override_uplift_is_split_equally_per_signal_unit():
     signals = {"header_auth_failed": True, "urgency_detected": False, "suspicious_urls": 3,
-               "typosquatting_detected": True}
+               "typosquatting_detected": True, "ip_url_detected": True}
     url_feats = {"any_http_url": 1, "any_phishing_tld": 1, "any_typosquatting": 1}
     units = override_units(signals, url_feats)
-    # typosquatting is counted directly and again inside suspicious_urls (capped at 2 units).
-    assert [u[1] for u in units] == ["typosquatting_detected", "header_auth_failed", "non_https_link",
-                                     "suspicious_tld"]
+    # typosquatting counts once; a plain http:// link is reported but not counted (audit B8).
+    assert [u[1] for u in units] == ["typosquatting_detected", "header_auth_failed", "suspicious_tld",
+                                     "ip_url"]
     ig = _ig([_w("hello", "body", -4.0)], f_input=-3.6, f_baseline=0.4)
     p_model = 1 / (1 + np.exp(3.6))
     e = _fuse(ig, signals, url_feats, decided={"classification": "PHISHING", "risk_score": 0.25},
@@ -235,7 +235,8 @@ def test_fired_signals_without_override_carry_no_weight():
     e = _fuse(ig, signals, auth={"spf": "fail"})
     assert e.override is None
     rule = [c for f in e.threat_factors for c in f.components if c.source == "rule"]
-    assert [c.name for c in rule] == ["header_auth_failed"] and rule[0].contribution == 0.0
+    assert {c.name for c in rule} == {"header_auth_failed", "urgency"}
+    assert all(c.contribution == 0.0 for c in rule)
     wording = next(f for f in e.threat_factors if f.key == "wording")
     assert "urgent language" in wording.evidence
 
@@ -275,3 +276,22 @@ def test_legitimate_summary_names_what_lowered_risk():
     e = _fuse(ig, model_cls="LEGITIMATE", urls=())
     assert e.summary.startswith("LEGITIMATE")
     assert "roadmap" in e.summary
+
+
+def test_urgency_alone_is_not_a_unit_and_bec_counts_twice():
+    assert override_units(dict(SIG_NONE, urgency_detected=True), URL_NONE) == []
+    units = override_units(dict(SIG_NONE, bec_detected=True), URL_NONE)
+    assert [u[1] for u in units] == ["bec_request", "bec_pressure"]
+
+
+def test_trusted_sender_downgrade_adds_up_and_is_explained():
+    ig = _ig([_w("order", "subject", 3.0), _w("account", "body", 2.0)], f_input=5.4, f_baseline=0.4)
+    p_model = 1 / (1 + np.exp(-5.4))
+    e = _fuse(ig, decided={"classification": "LEGITIMATE", "risk_score": 0.04, "adjustment": "trusted_sender"},
+              model_cls="PHISHING", p_model=p_model, urls=("https://www.amazon.com/orders",))
+    assert e.override == "trusted_sender"
+    auth = next(f for f in e.threat_factors if f.key == "sender_auth")
+    trust = [c for c in auth.components if c.name == "trusted_sender"]
+    assert len(trust) == 1 and trust[0].contribution == pytest.approx(0.04 - p_model, abs=1e-4)
+    assert e.baseline_score + sum(f.contribution for f in e.threat_factors) == pytest.approx(0.04, abs=1e-3)
+    assert "lowered to LEGITIMATE" in e.summary

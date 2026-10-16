@@ -451,6 +451,18 @@ body {
   padding-top: var(--spacing-8);
 }
 
+.adjustment-note {
+  font-family: var(--font-inter);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-ash);
+  margin-top: 8px;
+}
+
+.adjustment-note.hidden {
+  display: none;
+}
+
 .meta-badge {
   font-family: var(--font-inter);
   font-size: 11px;

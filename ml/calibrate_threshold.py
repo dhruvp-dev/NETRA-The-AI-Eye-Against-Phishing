@@ -80,6 +80,20 @@ def sweep_thresholds(y_true: np.ndarray, y_prob: np.ndarray) -> pd.DataFrame:
     })
 
 
+# The SUSPICIOUS band must be wide enough to hold real scores (audit B2: a 0.0002-wide band was unreachable).
+MIN_SUSPICIOUS_BAND = 0.03
+# F1 within this distance of the best counts as "the same"; a plateau wider than PLATEAU_MAX_WIDTH
+# means the scores are saturated and max-F1 picks an arbitrary point on it.
+PLATEAU_F1_TOLERANCE = 0.005
+PLATEAU_MAX_WIDTH = 0.5
+
+
+def f1_plateau_width(df_sweep: pd.DataFrame) -> float:
+    """Width of the threshold range whose F1 is within PLATEAU_F1_TOLERANCE of the best."""
+    near = df_sweep[df_sweep["f1"] >= df_sweep["f1"].max() - PLATEAU_F1_TOLERANCE]["threshold"]
+    return float(near.max() - near.min()) if not near.empty else 0.0
+
+
 def pick_thresholds(df_sweep: pd.DataFrame, suspicious_recall: float):
     best = df_sweep.loc[df_sweep["f1"].idxmax()]
     phishing = float(best["threshold"])
@@ -92,7 +106,21 @@ def pick_thresholds(df_sweep: pd.DataFrame, suspicious_recall: float):
         susp_lower = round(phishing * 0.6, 4)
         log.warning(f"Recall {suspicious_recall} is not reached below the phishing threshold; "
                     f"falling back to suspicious_lower = 0.6 * phishing = {susp_lower}")
+    if phishing - susp_lower < MIN_SUSPICIOUS_BAND:
+        if phishing - MIN_SUSPICIOUS_BAND <= 0:
+            phishing = 2 * MIN_SUSPICIOUS_BAND
+        susp_lower = phishing - MIN_SUSPICIOUS_BAND
+        log.warning(f"SUSPICIOUS band too narrow; widened to [{susp_lower:.4f}, {phishing:.4f})")
     return best, phishing, susp_lower
+
+
+def saturated(df_sweep: pd.DataFrame) -> bool:
+    width = f1_plateau_width(df_sweep)
+    if width > PLATEAU_MAX_WIDTH:
+        log.warning(f"F1 is flat over a {width:.2f}-wide threshold range: scores are saturated and "
+                    "max-F1 is arbitrary. Thresholds are NOT written (use --force to write anyway).")
+        return True
+    return False
 
 
 def print_sweep(df_sweep: pd.DataFrame, best_row) -> None:
@@ -166,6 +194,9 @@ def run_distilbert(args) -> dict:
     print(f"\nPhishing threshold (max F1): {phishing:.4f} | P={best['precision']} R={best['recall']} "
           f"F1={best['f1']} FPR={best['fpr']}")
     print(f"Suspicious lower (recall>={args.suspicious_recall}): {susp_lower:.4f}")
+    if saturated(df_sweep) and not args.force:
+        existing = models_dir / "threshold_config.json"
+        return json.loads(existing.read_text(encoding="utf-8")) if existing.exists() else {}
 
     updates = {
         "phishing_threshold": float(phishing),
@@ -223,6 +254,8 @@ def run_rf(args) -> dict:
     df_sweep = sweep_thresholds(y, p)
     best, phishing, susp_lower = pick_thresholds(df_sweep, args.suspicious_recall)
     print_sweep(df_sweep, best)
+    if saturated(df_sweep) and not args.force:
+        return {}
 
     config = {
         "phishing_threshold": float(phishing),
@@ -248,6 +281,8 @@ if __name__ == "__main__":
                         help="Also calibrate on PhishTank/OpenPhish URL-only rows (not recommended)")
     parser.add_argument("--suspicious_recall", type=float, default=0.95,
                         help="Recall target that sets the lower edge of the SUSPICIOUS band")
+    parser.add_argument("--force", action="store_true",
+                        help="Write thresholds even when the F1 curve is flat (saturated scores)")
     args = parser.parse_args()
     cfg = run_distilbert(args) if args.model == "distilbert" else run_rf(args)
     print(f"\nConfig:\n{json.dumps(cfg, indent=2)}")
