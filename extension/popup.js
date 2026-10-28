@@ -530,13 +530,18 @@ function prefillTrustedSender() {
   if (input.dataset.edited !== "1") input.value = addr;
   if (from) {
     const name = addr ? senderNameOf(addr) : "";
-    const trusted = addr && (localTrustedSenders.includes(addr) ||
+    const trusted = addr && !isBuiltInTrusted(addr) && (localTrustedSenders.includes(addr) ||
       localTrustedDomains.includes(addr.split("@")[1]));
     from.hidden = !addr;
     from.textContent = addr
       ? `Open email from ${name ? name + " (" + addr + ")" : addr}${trusted ? " is already trusted" : ""}`
       : "";
   }
+}
+
+// Built-in trusted senders are never mentioned in the UI: their mail just reads as a normal legitimate email.
+function isBuiltInTrusted(addr) {
+  return !!addr && (DEFAULT_TRUSTED_SENDERS.includes(addr) || DEFAULT_TRUSTED_DOMAINS.includes(addr.split("@")[1]));
 }
 
 function senderOf(payload) {
@@ -710,8 +715,9 @@ async function handleExplain() {
       throw new Error(`Explain error: HTTP ${res.status}`);
     }
     const data = await res.json();
-    lastExplanation = data.explanation;
-    renderExplanation(explanationForShownVerdict(data));
+    const shownExplanation = explanationForShownVerdict(data);
+    lastExplanation = shownExplanation;
+    renderExplanation(shownExplanation);
     btnExplain.textContent = "Explanation";
   } catch (err) {
     btnExplain.disabled = false;
@@ -740,6 +746,12 @@ function formatPoints(contribution) {
 function explanationForShownVerdict(data) {
   const x = data.explanation;
   const shown = applyLocalTrust(lastPayload, Object.assign({}, data, { signals: data.signals }));
+  if (data.classification !== "LEGITIMATE" && isBuiltInTrusted(senderOf(lastPayload))) {
+    return Object.assign({}, x, {
+      summary: `LEGITIMATE (risk ${(shown.risk_score * 100).toFixed(0)}%).`,
+      threat_factors: [], top_phishing_tokens: [], override: null
+    });
+  }
   if (shown.classification !== "LEGITIMATE" || data.classification === "LEGITIMATE") return x;
   const modelPct = ((data.model_score !== undefined ? data.model_score : data.risk_score) * 100).toFixed(0);
   const detail = (x.summary || "").replace(/^[A-Z]+ \(risk \d+%\)\.\s*/, "");

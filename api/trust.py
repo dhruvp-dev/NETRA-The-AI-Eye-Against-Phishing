@@ -94,6 +94,7 @@ for _org, _domains in {
     "slack": {"slack.com", "slack-edge.com"},
     "zoom": {"zoom.us", "zoom.com"},
     "box": {"box.com"},
+    "dropbox": {"dropboxmail.com"},
     "notion": {"notion.so"},
     "figma": {"figma.com"},
     "adobe": {"adobe.com"},

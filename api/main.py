@@ -224,6 +224,7 @@ class ModelState:
     # DistilBERT (primary)
     db_model = None
     db_tokenizer = None
+    db_device: str = "cpu"
     db_config: dict = {}
     db_ready: bool = False
 
@@ -354,7 +355,16 @@ def load_models() -> None:
             db_model.load_state_dict(
                 torch.load(DISTILBERT_MODEL_PATH, map_location="cpu", weights_only=True)
             )
+            # Same order as ml/train_distilbert.py: pick_device (CUDA, then MPS, then CPU).
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+            db_model.to(device)
             db_model.eval()
+            log.info(f"DistilBERT device: {device}")
             # Frozen: /explain needs gradients w.r.t. inputs only, never w.r.t. weights.
             for p in db_model.parameters():
                 p.requires_grad_(False)
@@ -362,6 +372,7 @@ def load_models() -> None:
             state.db_config = db_cfg
             state.db_tokenizer = AutoTokenizer.from_pretrained(str(DISTILBERT_TOKENIZER_PATH))
             state.db_model = db_model
+            state.db_device = str(device)
             state.db_ready = True
             log.info("DistilBERT model loaded.")
         except Exception as e:
@@ -717,10 +728,11 @@ def _score_windows(windows: List[str], hdr_values: List[float]) -> np.ndarray:
     max_len = int(state.db_config.get("max_length", 256))
     enc = state.db_tokenizer(windows if len(windows) > 1 else windows[0], max_length=max_len,
                              truncation=True, padding="max_length", return_tensors="pt")
-    hdr_tensor = torch.tensor([hdr_values] * len(windows), dtype=torch.float32)
+    device = state.db_device
+    hdr_tensor = torch.tensor([hdr_values] * len(windows), dtype=torch.float32, device=device)
     with torch.no_grad():
-        logits = state.db_model(enc["input_ids"], enc["attention_mask"], hdr_tensor)
-        return torch.softmax(logits, dim=1).numpy()
+        logits = state.db_model(enc["input_ids"].to(device), enc["attention_mask"].to(device), hdr_tensor)
+        return torch.softmax(logits, dim=1).cpu().numpy()
 
 
 def _prepare_distilbert_inputs(req: PredictRequest, urls: List[str]):
